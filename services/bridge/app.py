@@ -16,6 +16,22 @@ import requests
 
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
+MODEL_REASONING_CONFIG_KEY = "model_reasoning_effort"
+DEFAULT_REASONING_LEVEL = "medium"
+MODEL_CHOICES = [
+    ("default", "Auto"),
+    ("gpt-5.4", "gpt-5.4"),
+    ("gpt-5.4-mini", "gpt-5.4-mini"),
+    ("gpt-5.3-codex", "gpt-5.3-codex"),
+    ("gpt-5.2", "gpt-5.2"),
+]
+THINKING_CHOICES = [
+    ("default", "Auto"),
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+    ("xhigh", "XHigh"),
+]
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 ALLOWED_CHAT_IDS = {
@@ -98,6 +114,31 @@ class CodexTelegramBridge:
     def send_chat_action(self, chat_id: str, action: str = "typing") -> None:
         self._telegram("sendChatAction", data={"chat_id": chat_id, "action": action})
 
+    def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
+        data: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            data["text"] = text
+        self._telegram("answerCallbackQuery", data=data)
+
+    def edit_message(
+        self,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        data: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": TELEGRAM_PARSE_MODE,
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            data["reply_markup"] = json.dumps(reply_markup)
+        self._telegram("editMessageText", data=data)
+
     def send_markdown(
         self,
         chat_id: str,
@@ -133,13 +174,33 @@ class CodexTelegramBridge:
                     fallback_data["reply_to_message_id"] = reply_to_message_id
                 self._telegram("sendMessage", data=fallback_data)
 
+    def send_panel(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        data: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": TELEGRAM_PARSE_MODE,
+            "disable_web_page_preview": True,
+        }
+        if reply_to_message_id is not None:
+            data["reply_to_message_id"] = reply_to_message_id
+        if reply_markup is not None:
+            data["reply_markup"] = json.dumps(reply_markup)
+        self._telegram("sendMessage", data=data)
+
     def get_updates(self) -> list[dict[str, Any]]:
         response = self._telegram(
             "getUpdates",
             data={
                 "offset": self.offset + 1,
                 "timeout": TELEGRAM_POLL_SECONDS,
-                "allowed_updates": json.dumps(["message"]),
+                "allowed_updates": json.dumps(["message", "callback_query"]),
             },
         )
         return response.get("result", [])
@@ -171,6 +232,8 @@ class CodexTelegramBridge:
         logged_in, auth_text = self.get_login_status(chat_id)
         session = self.get_or_create_chat_session(chat_id)
         has_active_context = bool(str(session.get("thread_id") or "").strip())
+        current_model = self.get_effective_model(chat_id)
+        current_reasoning = self.get_effective_reasoning(chat_id)
         lines = [
             "<b>Codex Telegram Bridge</b>",
             f"<b>Codex version:</b> <code>{escape_html(current or 'unknown')}</code>",
@@ -179,6 +242,8 @@ class CodexTelegramBridge:
             f"<b>Auth mode:</b> <code>{escape_html(CODEX_AUTH_MODE)}</code>",
             f"<b>Login:</b> <code>{'ready' if logged_in else 'required'}</code>",
             f"<b>Context:</b> <code>{'active' if has_active_context else 'fresh'}</code>",
+            f"<b>Model:</b> <code>{escape_html(current_model)}</code>",
+            f"<b>Thinking:</b> <code>{escape_html(current_reasoning)}</code>",
         ]
         if auth_text:
             lines.append(f"<b>Session:</b> {escape_html(auth_text)}")
@@ -208,6 +273,7 @@ class CodexTelegramBridge:
                         "<code>/login cancel</code> cancel device auth",
                         "<code>/logout</code> remove stored credentials for this chat",
                         "<code>/new</code> start a fresh Codex chat",
+                        "<code>/model</code> choose model and thinking",
                         "<code>/status</code> show runtime status",
                         "<code>/version</code> show installed Codex CLI version",
                         "<code>/update</code> force a Codex CLI update check",
@@ -253,6 +319,10 @@ class CodexTelegramBridge:
 
         if command == "/new":
             self.handle_new_command(chat_id, message_id)
+            return
+
+        if command == "/model":
+            self.handle_model_command(chat_id, message_id)
             return
 
         if command == "/run":
@@ -340,6 +410,8 @@ class CodexTelegramBridge:
 
         session = self.get_or_create_chat_session(chat_id)
         thread_id = str(session.get("thread_id") or "").strip()
+        effective_model = self.get_selected_model(chat_id) or CODEX_MODEL
+        selected_reasoning = self.get_selected_reasoning(chat_id)
         if thread_id:
             command = [
                 "codex",
@@ -350,8 +422,10 @@ class CodexTelegramBridge:
                 str(last_message_file),
                 "--skip-git-repo-check",
             ]
-            if CODEX_MODEL:
-                command.extend(["-m", CODEX_MODEL])
+            if effective_model:
+                command.extend(["-m", effective_model])
+            if selected_reasoning:
+                command.extend(["-c", f'{MODEL_REASONING_CONFIG_KEY}="{selected_reasoning}"'])
             command.extend(CODEX_EXTRA_ARGS)
             command.extend([thread_id, prompt])
         else:
@@ -365,8 +439,10 @@ class CodexTelegramBridge:
                 str(last_message_file),
             ]
 
-            if CODEX_MODEL:
-                command.extend(["-m", CODEX_MODEL])
+            if effective_model:
+                command.extend(["-m", effective_model])
+            if selected_reasoning:
+                command.extend(["-c", f'{MODEL_REASONING_CONFIG_KEY}="{selected_reasoning}"'])
 
             command.extend(CODEX_EXTRA_ARGS)
             command.append(prompt)
@@ -471,6 +547,98 @@ class CodexTelegramBridge:
             reply_to_message_id=message_id,
             already_formatted=True,
         )
+
+    def handle_model_command(self, chat_id: str, message_id: int) -> None:
+        self.send_panel(
+            chat_id,
+            self.build_model_picker_text(chat_id),
+            reply_to_message_id=message_id,
+            reply_markup=self.build_model_picker_markup(chat_id),
+        )
+
+    def handle_callback_query(self, callback_query: dict[str, Any]) -> None:
+        callback_query_id = str(callback_query.get("id") or "")
+        data = str(callback_query.get("data") or "")
+        message = callback_query.get("message") or {}
+        chat = message.get("chat") or {}
+        chat_id = str(chat.get("id") or "")
+        message_id = int(message.get("message_id") or 0)
+
+        if not callback_query_id or not data or not chat_id or not message_id:
+            return
+        if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
+            self.answer_callback_query(callback_query_id)
+            return
+        if not data.startswith("model:"):
+            self.answer_callback_query(callback_query_id)
+            return
+
+        parts = data.split(":", 2)
+        kind = parts[1] if len(parts) > 1 else ""
+        value = parts[2] if len(parts) > 2 else ""
+
+        if kind == "close":
+            self.edit_message(chat_id, message_id, self.build_model_picker_text(chat_id))
+            self.answer_callback_query(callback_query_id, "Closed")
+            return
+
+        if kind == "model":
+            self.set_chat_preference(chat_id, "model", None if value == "default" else value)
+            self.edit_message(
+                chat_id,
+                message_id,
+                self.build_model_picker_text(chat_id),
+                reply_markup=self.build_model_picker_markup(chat_id),
+            )
+            self.answer_callback_query(callback_query_id, "Model updated")
+            return
+
+        if kind == "thinking":
+            self.set_chat_preference(chat_id, "reasoning_effort", None if value == "default" else value)
+            self.edit_message(
+                chat_id,
+                message_id,
+                self.build_model_picker_text(chat_id),
+                reply_markup=self.build_model_picker_markup(chat_id),
+            )
+            self.answer_callback_query(callback_query_id, "Thinking updated")
+            return
+
+        self.answer_callback_query(callback_query_id)
+
+    def build_model_picker_text(self, chat_id: str) -> str:
+        return "\n".join(
+            [
+                "<b>Model settings</b>",
+                f"<b>Model:</b> <code>{escape_html(self.get_effective_model(chat_id))}</code>",
+                f"<b>Thinking:</b> <code>{escape_html(self.get_effective_reasoning(chat_id))}</code>",
+                "",
+                "Choose a model and a thinking level below.",
+            ]
+        )
+
+    def build_model_picker_markup(self, chat_id: str) -> dict[str, Any]:
+        selected_model = self.get_selected_model(chat_id) or "default"
+        selected_reasoning = self.get_selected_reasoning(chat_id) or "default"
+        keyboard: list[list[dict[str, str]]] = []
+
+        for value, label in MODEL_CHOICES:
+            prefix = "• " if value == selected_model else ""
+            keyboard.append(
+                [{"text": f"{prefix}{label}", "callback_data": f"model:model:{value}"}]
+            )
+
+        keyboard.append(
+            [
+                {
+                    "text": ("• " if value == selected_reasoning else "") + label,
+                    "callback_data": f"model:thinking:{value}",
+                }
+                for value, label in THINKING_CHOICES
+            ]
+        )
+        keyboard.append([{"text": "Close", "callback_data": "model:close"}])
+        return {"inline_keyboard": keyboard}
 
     def send_login_status(self, chat_id: str, message_id: int) -> None:
         with self.login_lock:
@@ -729,6 +897,8 @@ class CodexTelegramBridge:
                 "thread_id": None,
                 "created_at": utc_now(),
                 "last_prompt": None,
+                "model": None,
+                "reasoning_effort": None,
             }
             self.chat_sessions[chat_id] = session
             self._save_state()
@@ -743,6 +913,29 @@ class CodexTelegramBridge:
         self.chat_sessions[chat_id] = session
         self._save_state()
 
+    def set_chat_preference(self, chat_id: str, key: str, value: str | None) -> None:
+        session = self.get_or_create_chat_session(chat_id)
+        session[key] = value
+        session["updated_at"] = utc_now()
+        self.chat_sessions[chat_id] = session
+        self._save_state()
+
+    def get_selected_model(self, chat_id: str) -> str | None:
+        session = self.get_or_create_chat_session(chat_id)
+        value = session.get("model")
+        return str(value).strip() if value else None
+
+    def get_selected_reasoning(self, chat_id: str) -> str | None:
+        session = self.get_or_create_chat_session(chat_id)
+        value = session.get("reasoning_effort")
+        return str(value).strip() if value else None
+
+    def get_effective_model(self, chat_id: str) -> str:
+        return self.get_selected_model(chat_id) or CODEX_MODEL or "auto"
+
+    def get_effective_reasoning(self, chat_id: str) -> str:
+        return self.get_selected_reasoning(chat_id) or DEFAULT_REASONING_LEVEL
+
     def _typing_heartbeat(self, chat_id: str, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
             try:
@@ -755,6 +948,11 @@ class CodexTelegramBridge:
         update_id = int(update["update_id"])
         self.offset = max(self.offset, update_id)
         self._save_state()
+
+        callback_query = update.get("callback_query")
+        if isinstance(callback_query, dict):
+            self.handle_callback_query(callback_query)
+            return
 
         message = update.get("message") or {}
         chat = message.get("chat") or {}
