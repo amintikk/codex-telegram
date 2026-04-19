@@ -170,7 +170,7 @@ class CodexTelegramBridge:
         current = get_current_codex_version()
         logged_in, auth_text = self.get_login_status(chat_id)
         session = self.get_or_create_chat_session(chat_id)
-        thread_status = session.get("thread_id") or "new"
+        has_active_context = bool(str(session.get("thread_id") or "").strip())
         lines = [
             "<b>Codex Telegram Bridge</b>",
             f"<b>Codex version:</b> <code>{escape_html(current or 'unknown')}</code>",
@@ -178,8 +178,7 @@ class CodexTelegramBridge:
             f"<b>Channel:</b> <code>{escape_html(CODEX_CHANNEL)}</code>",
             f"<b>Auth mode:</b> <code>{escape_html(CODEX_AUTH_MODE)}</code>",
             f"<b>Login:</b> <code>{'ready' if logged_in else 'required'}</code>",
-            f"<b>Chat session:</b> <code>{int(session.get('serial') or 1)}</code>",
-            f"<b>Codex thread:</b> <code>{escape_html(thread_status)}</code>",
+            f"<b>Context:</b> <code>{'active' if has_active_context else 'fresh'}</code>",
         ]
         if auth_text:
             lines.append(f"<b>Session:</b> {escape_html(auth_text)}")
@@ -459,10 +458,7 @@ class CodexTelegramBridge:
                 )
                 return
 
-            session = self.get_or_create_chat_session(chat_id)
-            serial = int(session.get("serial") or 1) + 1
             self.chat_sessions[chat_id] = {
-                "serial": serial,
                 "thread_id": None,
                 "created_at": utc_now(),
                 "last_prompt": None,
@@ -471,7 +467,7 @@ class CodexTelegramBridge:
 
         self.send_markdown(
             chat_id,
-            f"<b>New chat ready</b>\nCurrent session: <code>{serial}</code>\nThe next message will start with a fresh Codex context.",
+            "<b>New chat ready</b>\nThe next message will start with a fresh Codex context.",
             reply_to_message_id=message_id,
             already_formatted=True,
         )
@@ -730,7 +726,6 @@ class CodexTelegramBridge:
         session = self.chat_sessions.get(chat_id)
         if session is None:
             session = {
-                "serial": 1,
                 "thread_id": None,
                 "created_at": utc_now(),
                 "last_prompt": None,
