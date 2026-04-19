@@ -165,7 +165,7 @@ class CodexTelegramBridge:
                 "parse_mode": TELEGRAM_PARSE_MODE,
                 "disable_web_page_preview": True,
             }
-            if index == 0 and reply_to_message_id is not None:
+            if index == 0 and reply_to_message_id:
                 data["reply_to_message_id"] = reply_to_message_id
             try:
                 self._telegram("sendMessage", data=data)
@@ -175,7 +175,7 @@ class CodexTelegramBridge:
                     "text": html_to_plain_text(rendered),
                     "disable_web_page_preview": True,
                 }
-                if index == 0 and reply_to_message_id is not None:
+                if index == 0 and reply_to_message_id:
                     fallback_data["reply_to_message_id"] = reply_to_message_id
                 self._telegram("sendMessage", data=fallback_data)
 
@@ -193,7 +193,7 @@ class CodexTelegramBridge:
             "parse_mode": TELEGRAM_PARSE_MODE,
             "disable_web_page_preview": True,
         }
-        if reply_to_message_id is not None:
+        if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
         if reply_markup is not None:
             data["reply_markup"] = json.dumps(reply_markup)
@@ -546,11 +546,11 @@ class CodexTelegramBridge:
                 )
                 return
 
-            self.chat_sessions[chat_id] = {
-                "thread_id": None,
-                "created_at": utc_now(),
-                "last_prompt": None,
-            }
+            session = self.get_or_create_chat_session(chat_id)
+            session["thread_id"] = None
+            session["last_prompt"] = None
+            session["updated_at"] = utc_now()
+            self.chat_sessions[chat_id] = session
             self._save_state()
 
         self.send_markdown(
@@ -574,11 +574,11 @@ class CodexTelegramBridge:
         remainder = remainder.strip()
 
         if not action or action in {"list", "ls"}:
-            self.send_markdown(
+            self.send_panel(
                 chat_id,
-                self.format_cron_overview(chat_id),
+                self.build_cron_panel_text(chat_id),
                 reply_to_message_id=message_id,
-                already_formatted=True,
+                reply_markup=self.build_cron_panel_markup(chat_id),
             )
             return
 
@@ -783,6 +783,87 @@ class CodexTelegramBridge:
             )
         return "\n".join(lines)
 
+    def build_cron_panel_text(self, chat_id: str) -> str:
+        jobs = self.get_chat_cron_jobs(chat_id)
+        lines = [
+            "<b>Cron jobs</b>",
+            f"<b>Timezone:</b> <code>{escape_html(CRON_TIMEZONE)}</code>",
+            f"<b>Total:</b> <code>{len(jobs)}</code>",
+        ]
+        if not jobs:
+            lines.append("")
+            lines.append("No cron jobs configured.")
+            lines.append("Use the buttons below to add your first one.")
+            return "\n".join(lines)
+
+        for job in jobs[:8]:
+            status = "on" if job.get("enabled") else "off"
+            lines.append("")
+            lines.append(f"<b>{escape_html(str(job.get('name') or 'cron'))}</b> <code>{status}</code>")
+            lines.append(f"Next: <code>{escape_html(self.format_when(str(job.get('next_run_at') or '')))}</code>")
+        if len(jobs) > 8:
+            lines.append("")
+            lines.append(f"And <code>{len(jobs) - 8}</code> more.")
+        return "\n".join(lines)
+
+    def build_cron_panel_markup(self, chat_id: str) -> dict[str, Any]:
+        jobs = self.get_chat_cron_jobs(chat_id)
+        keyboard: list[list[dict[str, str]]] = [
+            [
+                {"text": "Add cron", "callback_data": "cron:add"},
+                {"text": "Refresh", "callback_data": "cron:panel"},
+            ]
+        ]
+        for job in jobs[:8]:
+            status = "on" if job.get("enabled") else "off"
+            keyboard.append(
+                [
+                    {
+                        "text": f"{job.get('name') or job.get('id')} [{status}]",
+                        "callback_data": f"cron:view:{job.get('id')}",
+                    }
+                ]
+            )
+        if self.get_cron_draft(chat_id):
+            keyboard.append([{"text": "Cancel add", "callback_data": "cron:add_cancel"}])
+        keyboard.append([{"text": "Close", "callback_data": "cron:close"}])
+        return {"inline_keyboard": keyboard}
+
+    def build_cron_job_text(self, chat_id: str, job_id: str) -> str:
+        job = self.find_cron_job(chat_id, job_id)
+        if job is None:
+            return "<b>Cron not found</b>"
+        return "\n".join(
+            [
+                "<b>Cron job</b>",
+                f"<b>Name:</b> <code>{escape_html(str(job.get('name') or ''))}</code>",
+                f"<b>ID:</b> <code>{escape_html(str(job.get('id') or ''))}</code>",
+                f"<b>Status:</b> <code>{'on' if job.get('enabled') else 'off'}</code>",
+                f"<b>Schedule:</b> <code>{escape_html(str(job.get('schedule') or ''))}</code>",
+                f"<b>Next:</b> <code>{escape_html(self.format_when(str(job.get('next_run_at') or '')))}</code>",
+                f"<b>Prompt:</b> <code>{escape_html(str(job.get('prompt') or '')[:250])}</code>",
+            ]
+        )
+
+    def build_cron_job_markup(self, chat_id: str, job_id: str) -> dict[str, Any]:
+        job = self.find_cron_job(chat_id, job_id)
+        if job is None:
+            return {"inline_keyboard": [[{"text": "Back", "callback_data": "cron:panel"}]]}
+        toggle_action = "pause" if job.get("enabled") else "resume"
+        toggle_label = "Pause" if job.get("enabled") else "Resume"
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "Run now", "callback_data": f"cron:run:{job_id}"},
+                    {"text": toggle_label, "callback_data": f"cron:{toggle_action}:{job_id}"},
+                ],
+                [
+                    {"text": "Delete", "callback_data": f"cron:delete:{job_id}"},
+                    {"text": "Back", "callback_data": "cron:panel"},
+                ],
+            ]
+        }
+
     def handle_callback_query(self, callback_query: dict[str, Any]) -> None:
         callback_query_id = str(callback_query.get("id") or "")
         data = str(callback_query.get("data") or "")
@@ -796,6 +877,10 @@ class CodexTelegramBridge:
         if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
             self.answer_callback_query(callback_query_id)
             return
+        if data.startswith("cron:"):
+            self.handle_cron_callback(callback_query_id, chat_id, message_id, data)
+            return
+
         if not data.startswith("model:"):
             self.answer_callback_query(callback_query_id)
             return
@@ -829,6 +914,136 @@ class CodexTelegramBridge:
                 reply_markup=self.build_model_picker_markup(chat_id),
             )
             self.answer_callback_query(callback_query_id, "Thinking updated")
+            return
+
+        self.answer_callback_query(callback_query_id)
+
+    def handle_cron_callback(self, callback_query_id: str, chat_id: str, message_id: int, data: str) -> None:
+        parts = data.split(":", 2)
+        action = parts[1] if len(parts) > 1 else ""
+        value = parts[2] if len(parts) > 2 else ""
+
+        if action == "panel":
+            self.edit_message(
+                chat_id,
+                message_id,
+                self.build_cron_panel_text(chat_id),
+                reply_markup=self.build_cron_panel_markup(chat_id),
+            )
+            self.answer_callback_query(callback_query_id)
+            return
+
+        if action == "close":
+            self.edit_message(chat_id, message_id, "<b>Cron panel closed</b>")
+            self.answer_callback_query(callback_query_id, "Closed")
+            return
+
+        if action == "add":
+            self.start_cron_draft(chat_id)
+            self.edit_message(
+                chat_id,
+                message_id,
+                "<b>New cron</b>\nSend the cron name in your next message.",
+                reply_markup={
+                    "inline_keyboard": [[{"text": "Cancel", "callback_data": "cron:add_cancel"}]]
+                },
+            )
+            self.answer_callback_query(callback_query_id, "Send the name")
+            return
+
+        if action == "add_cancel":
+            self.clear_cron_draft(chat_id)
+            self.edit_message(
+                chat_id,
+                message_id,
+                self.build_cron_panel_text(chat_id),
+                reply_markup=self.build_cron_panel_markup(chat_id),
+            )
+            self.answer_callback_query(callback_query_id, "Cancelled")
+            return
+
+        if action == "schedule":
+            if value == "custom":
+                self.update_cron_draft(chat_id, {"step": "custom_schedule"})
+                self.edit_message(
+                    chat_id,
+                    message_id,
+                    "<b>New cron</b>\nSend a 5-field cron expression in your next message.\nExample: <code>*/15 * * * *</code>",
+                    reply_markup={
+                        "inline_keyboard": [[{"text": "Cancel", "callback_data": "cron:add_cancel"}]]
+                    },
+                )
+                self.answer_callback_query(callback_query_id, "Send the schedule")
+                return
+            draft = self.get_cron_draft(chat_id)
+            if draft is None:
+                self.answer_callback_query(callback_query_id, "Start with Add cron")
+                return
+            draft["schedule"] = value
+            draft["step"] = "prompt"
+            self.update_cron_draft(chat_id, draft)
+            self.edit_message(
+                chat_id,
+                message_id,
+                "<b>New cron</b>\nNow send the prompt you want this cron to run.",
+                reply_markup={
+                    "inline_keyboard": [[{"text": "Cancel", "callback_data": "cron:add_cancel"}]]
+                },
+            )
+            self.answer_callback_query(callback_query_id, "Send the prompt")
+            return
+
+        if action == "confirm_save":
+            if self.finish_cron_draft(chat_id):
+                self.edit_message(
+                    chat_id,
+                    message_id,
+                    self.build_cron_panel_text(chat_id),
+                    reply_markup=self.build_cron_panel_markup(chat_id),
+                )
+                self.answer_callback_query(callback_query_id, "Cron saved")
+            else:
+                self.answer_callback_query(callback_query_id, "Cron data is incomplete")
+            return
+
+        if action == "view":
+            self.edit_message(
+                chat_id,
+                message_id,
+                self.build_cron_job_text(chat_id, value),
+                reply_markup=self.build_cron_job_markup(chat_id, value),
+            )
+            self.answer_callback_query(callback_query_id)
+            return
+
+        if action == "run":
+            job = self.find_cron_job(chat_id, value)
+            if job and self.try_start_cron_job(chat_id, job):
+                self.answer_callback_query(callback_query_id, "Cron started")
+            else:
+                self.answer_callback_query(callback_query_id, "Busy or cron not found")
+            return
+
+        if action in {"pause", "resume", "delete"}:
+            if action == "delete":
+                jobs = [job for job in self.get_chat_cron_jobs(chat_id) if job.get("id") != value]
+                self.set_chat_cron_jobs(chat_id, jobs)
+            else:
+                jobs = self.get_chat_cron_jobs(chat_id)
+                for job in jobs:
+                    if job.get("id") == value:
+                        job["enabled"] = action == "resume"
+                        if action == "resume":
+                            job["next_run_at"] = self.compute_next_run_iso(str(job.get("schedule") or ""))
+                        break
+                self.set_chat_cron_jobs(chat_id, jobs)
+            self.edit_message(
+                chat_id,
+                message_id,
+                self.build_cron_panel_text(chat_id),
+                reply_markup=self.build_cron_panel_markup(chat_id),
+            )
+            self.answer_callback_query(callback_query_id, "Updated")
             return
 
         self.answer_callback_query(callback_query_id)
@@ -1134,6 +1349,7 @@ class CodexTelegramBridge:
             session.setdefault("model", None)
             session.setdefault("reasoning_effort", None)
             session.setdefault("cron_jobs", [])
+            session.setdefault("cron_draft", None)
         return session
 
     def update_chat_session(self, chat_id: str, *, thread_id: str, last_prompt: str | None = None) -> None:
@@ -1151,6 +1367,157 @@ class CodexTelegramBridge:
         if isinstance(jobs, list):
             return jobs
         return []
+
+    def find_cron_job(self, chat_id: str, job_id: str) -> dict[str, Any] | None:
+        return next((job for job in self.get_chat_cron_jobs(chat_id) if job.get("id") == job_id), None)
+
+    def get_cron_draft(self, chat_id: str) -> dict[str, Any] | None:
+        session = self.get_or_create_chat_session(chat_id)
+        draft = session.get("cron_draft")
+        return draft if isinstance(draft, dict) else None
+
+    def update_cron_draft(self, chat_id: str, draft: dict[str, Any]) -> None:
+        session = self.get_or_create_chat_session(chat_id)
+        session["cron_draft"] = draft
+        session["updated_at"] = utc_now()
+        self.chat_sessions[chat_id] = session
+        self._save_state()
+
+    def clear_cron_draft(self, chat_id: str) -> None:
+        session = self.get_or_create_chat_session(chat_id)
+        session["cron_draft"] = None
+        session["updated_at"] = utc_now()
+        self.chat_sessions[chat_id] = session
+        self._save_state()
+
+    def start_cron_draft(self, chat_id: str) -> None:
+        self.update_cron_draft(chat_id, {"step": "name"})
+
+    def finish_cron_draft(self, chat_id: str) -> bool:
+        draft = self.get_cron_draft(chat_id)
+        if not draft:
+            return False
+        name = str(draft.get("name") or "").strip()
+        schedule = str(draft.get("schedule") or "").strip()
+        prompt = str(draft.get("prompt") or "").strip()
+        if not name or not schedule or not prompt or not croniter.is_valid(schedule):
+            return False
+        jobs = self.get_chat_cron_jobs(chat_id)
+        jobs.append(
+            {
+                "id": uuid.uuid4().hex[:8],
+                "name": name,
+                "schedule": schedule,
+                "prompt": prompt,
+                "enabled": True,
+                "created_at": utc_now(),
+                "last_run_at": None,
+                "next_run_at": self.compute_next_run_iso(schedule),
+            }
+        )
+        self.set_chat_cron_jobs(chat_id, jobs)
+        self.clear_cron_draft(chat_id)
+        return True
+
+    def handle_cron_draft_input(self, chat_id: str, text: str, message_id: int) -> bool:
+        draft = self.get_cron_draft(chat_id)
+        if not draft:
+            return False
+
+        if text.strip().lower() == "/cancel":
+            self.clear_cron_draft(chat_id)
+            self.send_markdown(
+                chat_id,
+                "<b>Cron creation cancelled</b>",
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return True
+
+        step = str(draft.get("step") or "")
+        if step == "name":
+            draft["name"] = text.strip()[:80]
+            draft["step"] = "schedule"
+            self.update_cron_draft(chat_id, draft)
+            self.send_panel(
+                chat_id,
+                "<b>New cron</b>\nChoose a schedule preset or pick custom.",
+                reply_to_message_id=message_id,
+                reply_markup=self.build_cron_schedule_markup(),
+            )
+            return True
+
+        if step == "custom_schedule":
+            schedule = text.strip()
+            if not croniter.is_valid(schedule):
+                self.send_markdown(
+                    chat_id,
+                    "<b>Invalid cron</b>\nSend a valid 5-field cron expression or <code>/cancel</code>.",
+                    reply_to_message_id=message_id,
+                    already_formatted=True,
+                )
+                return True
+            draft["schedule"] = schedule
+            draft["step"] = "prompt"
+            self.update_cron_draft(chat_id, draft)
+            self.send_markdown(
+                chat_id,
+                "<b>New cron</b>\nNow send the prompt this cron should run.",
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return True
+
+        if step == "prompt":
+            draft["prompt"] = text.strip()
+            draft["step"] = "confirm"
+            self.update_cron_draft(chat_id, draft)
+            self.send_panel(
+                chat_id,
+                self.build_cron_draft_summary(chat_id),
+                reply_to_message_id=message_id,
+                reply_markup={
+                    "inline_keyboard": [
+                        [
+                            {"text": "Save cron", "callback_data": "cron:confirm_save"},
+                            {"text": "Cancel", "callback_data": "cron:add_cancel"},
+                        ]
+                    ]
+                },
+            )
+            return True
+
+        return False
+
+    def build_cron_schedule_markup(self) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "Every 5 min", "callback_data": "cron:schedule:*/5 * * * *"},
+                    {"text": "Every 15 min", "callback_data": "cron:schedule:*/15 * * * *"},
+                ],
+                [
+                    {"text": "Every 30 min", "callback_data": "cron:schedule:*/30 * * * *"},
+                    {"text": "Hourly", "callback_data": "cron:schedule:0 * * * *"},
+                ],
+                [
+                    {"text": "Daily 09:00", "callback_data": "cron:schedule:0 9 * * *"},
+                    {"text": "Custom", "callback_data": "cron:schedule:custom"},
+                ],
+                [{"text": "Cancel", "callback_data": "cron:add_cancel"}],
+            ]
+        }
+
+    def build_cron_draft_summary(self, chat_id: str) -> str:
+        draft = self.get_cron_draft(chat_id) or {}
+        return "\n".join(
+            [
+                "<b>Confirm cron</b>",
+                f"<b>Name:</b> <code>{escape_html(str(draft.get('name') or ''))}</code>",
+                f"<b>Schedule:</b> <code>{escape_html(str(draft.get('schedule') or ''))}</code>",
+                f"<b>Prompt:</b> <code>{escape_html(str(draft.get('prompt') or '')[:250])}</code>",
+            ]
+        )
 
     def set_chat_cron_jobs(self, chat_id: str, jobs: list[dict[str, Any]]) -> None:
         session = self.get_or_create_chat_session(chat_id)
@@ -1224,6 +1591,9 @@ class CodexTelegramBridge:
         if not chat_id or not text:
             return
         if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
+            return
+
+        if self.handle_cron_draft_input(chat_id, text, message_id):
             return
 
         self.handle_command(chat_id, text, message_id)
