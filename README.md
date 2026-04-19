@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="./assets/logo.png" alt="Codex Telegram logo" width="160">
+  <img src="./assets/logo.png" alt="Codex Telegram Bridge logo" width="160">
 </p>
 
-<h1 align="center">Codex Telegram</h1>
+<h1 align="center">Codex Telegram Bridge</h1>
 
 <p align="center">
   Run the official Codex CLI from Telegram, inside Docker, against your host workspace.
@@ -15,7 +15,7 @@
 
 ## Overview
 
-`codex-telegram` is a clean bridge between Telegram and the official `@openai/codex` CLI.
+`codex-telegram-bridge` is a clean bridge between Telegram and the official `@openai/codex` CLI.
 
 It does not fork Codex and it does not wrap a fake shell around it. The container installs the official CLI, listens for Telegram messages, runs `codex exec`, and returns the result back to Telegram in readable chunks.
 
