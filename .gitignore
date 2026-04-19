@@ -1,0 +1,13 @@
+.env
+.env.local
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+
+data/*
+!data/.gitkeep
+shared-codex/*
+!shared-codex/.gitkeep
+saved sessions.png

@@ -1,0 +1,27 @@
+services:
+  codex-telegram:
+    build:
+      context: ./services/bridge
+    container_name: codex-telegram
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST_WORKSPACE: ${HOST_WORKSPACE:-/host/home/ubuntu}
+      CODEX_CHANNEL: ${CODEX_CHANNEL:-latest}
+      CODEX_MODEL: ${CODEX_MODEL:-}
+      CODEX_AUTH_MODE: ${CODEX_AUTH_MODE:-shared}
+      CODEX_AUTH_ROOT: ${CODEX_AUTH_ROOT:-/data/auth}
+      CODEX_EXTRA_ARGS: ${CODEX_EXTRA_ARGS:---skip-git-repo-check -s danger-full-access -a never}
+      AUTO_UPDATE: ${AUTO_UPDATE:-true}
+      AUTO_UPDATE_MIN_INTERVAL_SECONDS: ${AUTO_UPDATE_MIN_INTERVAL_SECONDS:-21600}
+      TELEGRAM_PARSE_MODE: ${TELEGRAM_PARSE_MODE:-HTML}
+      TELEGRAM_POLL_SECONDS: ${TELEGRAM_POLL_SECONDS:-30}
+      RUNS_DIR: /data/runs
+      STATE_FILE: /data/state.json
+    working_dir: /host/home/ubuntu
+    volumes:
+      - /home/ubuntu:/host/home/ubuntu
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${CODEX_CONFIG_DIR:-./shared-codex}:/root/.codex
+      - ./data:/data
