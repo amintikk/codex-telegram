@@ -86,6 +86,7 @@ list all running docker containers on this machine
 | `/logout` | Remove stored credentials for this chat |
 | `/new` | Start a fresh Codex conversation |
 | `/status` | Show bridge status |
+| `/cron` | View and manage scheduled tasks |
 | `/version` | Show installed Codex CLI version |
 | `/update` | Force a Codex update check |
 | `/help` | Show quick help |
@@ -124,6 +125,29 @@ The bridge keeps one active Codex thread per Telegram chat.
 
 - normal messages continue the current conversation
 - `/new` starts a fresh one
+
+## Cron jobs
+
+You can schedule prompts to run automatically from Telegram.
+
+Examples:
+
+```text
+/cron
+```
+
+```text
+/cron add docker-check | */30 * * * * | list all running docker containers
+```
+
+```text
+/cron pause <id>
+/cron resume <id>
+/cron delete <id>
+/cron run <id>
+```
+
+Cron jobs are stored per chat and run using that chat's current login, model, and thinking settings.
 
 ## Updating
 

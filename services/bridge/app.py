@@ -6,12 +6,15 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from datetime import UTC
 from datetime import datetime
 from html import escape as escape_html
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
+from croniter import croniter
 import requests
 
 
@@ -53,6 +56,8 @@ AUTO_UPDATE_MIN_INTERVAL_SECONDS = int(
 )
 TELEGRAM_PARSE_MODE = os.environ.get("TELEGRAM_PARSE_MODE", "MarkdownV2").strip() or "MarkdownV2"
 TELEGRAM_POLL_SECONDS = int(os.environ.get("TELEGRAM_POLL_SECONDS", "30").strip() or "30")
+CRON_POLL_SECONDS = int(os.environ.get("CRON_POLL_SECONDS", "15").strip() or "15")
+CRON_TIMEZONE = os.environ.get("CRON_TIMEZONE", "UTC").strip() or "UTC"
 RUNS_DIR = Path(os.environ.get("RUNS_DIR", "/data/runs"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/state.json"))
 
@@ -234,6 +239,7 @@ class CodexTelegramBridge:
         has_active_context = bool(str(session.get("thread_id") or "").strip())
         current_model = self.get_effective_model(chat_id)
         current_reasoning = self.get_effective_reasoning(chat_id)
+        cron_count = len(self.get_chat_cron_jobs(chat_id))
         lines = [
             "<b>Codex Telegram Bridge</b>",
             f"<b>Codex version:</b> <code>{escape_html(current or 'unknown')}</code>",
@@ -244,6 +250,7 @@ class CodexTelegramBridge:
             f"<b>Context:</b> <code>{'active' if has_active_context else 'fresh'}</code>",
             f"<b>Model:</b> <code>{escape_html(current_model)}</code>",
             f"<b>Thinking:</b> <code>{escape_html(current_reasoning)}</code>",
+            f"<b>Crons:</b> <code>{cron_count}</code>",
         ]
         if auth_text:
             lines.append(f"<b>Session:</b> {escape_html(auth_text)}")
@@ -274,6 +281,7 @@ class CodexTelegramBridge:
                         "<code>/logout</code> remove stored credentials for this chat",
                         "<code>/new</code> start a fresh Codex chat",
                         "<code>/model</code> choose model and thinking",
+                        "<code>/cron</code> manage scheduled tasks",
                         "<code>/status</code> show runtime status",
                         "<code>/version</code> show installed Codex CLI version",
                         "<code>/update</code> force a Codex CLI update check",
@@ -323,6 +331,10 @@ class CodexTelegramBridge:
 
         if command == "/model":
             self.handle_model_command(chat_id, message_id)
+            return
+
+        if command == "/cron":
+            self.handle_cron_command(chat_id, prompt, message_id)
             return
 
         if command == "/run":
@@ -555,6 +567,221 @@ class CodexTelegramBridge:
             reply_to_message_id=message_id,
             reply_markup=self.build_model_picker_markup(chat_id),
         )
+
+    def handle_cron_command(self, chat_id: str, prompt: str, message_id: int) -> None:
+        action, _, remainder = prompt.strip().partition(" ")
+        action = action.lower().strip()
+        remainder = remainder.strip()
+
+        if not action or action in {"list", "ls"}:
+            self.send_markdown(
+                chat_id,
+                self.format_cron_overview(chat_id),
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return
+
+        if action == "add":
+            self.handle_cron_add(chat_id, remainder, message_id)
+            return
+
+        if action in {"delete", "del", "remove", "rm"}:
+            self.handle_cron_delete(chat_id, remainder, message_id)
+            return
+
+        if action in {"pause", "disable", "off"}:
+            self.handle_cron_toggle(chat_id, remainder, False, message_id)
+            return
+
+        if action in {"resume", "enable", "on"}:
+            self.handle_cron_toggle(chat_id, remainder, True, message_id)
+            return
+
+        if action == "run":
+            self.handle_cron_run(chat_id, remainder, message_id)
+            return
+
+        self.send_markdown(
+            chat_id,
+            self.format_cron_help(),
+            reply_to_message_id=message_id,
+            already_formatted=True,
+        )
+
+    def handle_cron_add(self, chat_id: str, payload: str, message_id: int) -> None:
+        parts = [item.strip() for item in payload.split("|", 2)]
+        if len(parts) != 3 or not all(parts):
+            self.send_markdown(
+                chat_id,
+                self.format_cron_help(),
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return
+
+        name, schedule, cron_prompt = parts
+        if not croniter.is_valid(schedule):
+            self.send_markdown(
+                chat_id,
+                "<b>Invalid cron</b>\nUse a valid 5-field cron expression, for example <code>*/15 * * * *</code>.",
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return
+
+        try:
+            next_run = self.compute_next_run_iso(schedule)
+        except Exception as exc:
+            self.send_markdown(
+                chat_id,
+                f"<b>Invalid cron</b>\n{escape_html(str(exc))}",
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return
+
+        jobs = self.get_chat_cron_jobs(chat_id)
+        job_id = uuid.uuid4().hex[:8]
+        jobs.append(
+            {
+                "id": job_id,
+                "name": name,
+                "schedule": schedule,
+                "prompt": cron_prompt,
+                "enabled": True,
+                "created_at": utc_now(),
+                "last_run_at": None,
+                "next_run_at": next_run,
+            }
+        )
+        self.set_chat_cron_jobs(chat_id, jobs)
+        self.send_markdown(
+            chat_id,
+            "\n".join(
+                [
+                    "<b>Cron added</b>",
+                    f"<b>ID:</b> <code>{escape_html(job_id)}</code>",
+                    f"<b>Name:</b> <code>{escape_html(name)}</code>",
+                    f"<b>Schedule:</b> <code>{escape_html(schedule)}</code>",
+                    f"<b>Next:</b> <code>{escape_html(self.format_when(next_run))}</code>",
+                ]
+            ),
+            reply_to_message_id=message_id,
+            already_formatted=True,
+        )
+
+    def handle_cron_delete(self, chat_id: str, job_id: str, message_id: int) -> None:
+        jobs = self.get_chat_cron_jobs(chat_id)
+        filtered = [job for job in jobs if job.get("id") != job_id.strip()]
+        if len(filtered) == len(jobs):
+            self.send_markdown(
+                chat_id,
+                "<b>Cron not found</b>",
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return
+        self.set_chat_cron_jobs(chat_id, filtered)
+        self.send_markdown(
+            chat_id,
+            "<b>Cron deleted</b>",
+            reply_to_message_id=message_id,
+            already_formatted=True,
+        )
+
+    def handle_cron_toggle(self, chat_id: str, job_id: str, enabled: bool, message_id: int) -> None:
+        jobs = self.get_chat_cron_jobs(chat_id)
+        target = None
+        for job in jobs:
+            if job.get("id") == job_id.strip():
+                job["enabled"] = enabled
+                if enabled:
+                    job["next_run_at"] = self.compute_next_run_iso(str(job.get("schedule") or ""))
+                target = job
+                break
+        if target is None:
+            self.send_markdown(
+                chat_id,
+                "<b>Cron not found</b>",
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return
+        self.set_chat_cron_jobs(chat_id, jobs)
+        self.send_markdown(
+            chat_id,
+            f"<b>Cron {'enabled' if enabled else 'paused'}</b>\n<code>{escape_html(str(target.get('name') or target.get('id') or 'cron'))}</code>",
+            reply_to_message_id=message_id,
+            already_formatted=True,
+        )
+
+    def handle_cron_run(self, chat_id: str, job_id: str, message_id: int) -> None:
+        jobs = self.get_chat_cron_jobs(chat_id)
+        target = next((job for job in jobs if job.get("id") == job_id.strip()), None)
+        if target is None:
+            self.send_markdown(
+                chat_id,
+                "<b>Cron not found</b>",
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return
+        if not self.try_start_cron_job(chat_id, target):
+            self.send_markdown(
+                chat_id,
+                "<b>Busy</b>\nWait for the current task to finish before running a cron manually.",
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+
+    def format_cron_help(self) -> str:
+        return "\n".join(
+            [
+                "<b>Cron commands</b>",
+                "<code>/cron</code> show configured jobs",
+                "<code>/cron add name | */15 * * * * | prompt</code>",
+                "<code>/cron pause &lt;id&gt;</code>",
+                "<code>/cron resume &lt;id&gt;</code>",
+                "<code>/cron delete &lt;id&gt;</code>",
+                "<code>/cron run &lt;id&gt;</code>",
+                "",
+                f"<b>Timezone:</b> <code>{escape_html(CRON_TIMEZONE)}</code>",
+            ]
+        )
+
+    def format_cron_overview(self, chat_id: str) -> str:
+        jobs = self.get_chat_cron_jobs(chat_id)
+        lines = [
+            "<b>Configured crons</b>",
+            f"<b>Timezone:</b> <code>{escape_html(CRON_TIMEZONE)}</code>",
+        ]
+        if not jobs:
+            lines.extend(
+                [
+                    "",
+                    "No cron jobs configured.",
+                    "",
+                    "<b>Add one</b>",
+                    "<code>/cron add healthcheck | */30 * * * * | list all running docker containers</code>",
+                ]
+            )
+            return "\n".join(lines)
+
+        for job in jobs:
+            status = "on" if job.get("enabled") else "off"
+            next_run = self.format_when(str(job.get("next_run_at") or ""))
+            lines.extend(
+                [
+                    "",
+                    f"<b>{escape_html(str(job.get('name') or 'cron'))}</b> <code>{status}</code>",
+                    f"ID: <code>{escape_html(str(job.get('id') or ''))}</code>",
+                    f"Cron: <code>{escape_html(str(job.get('schedule') or ''))}</code>",
+                    f"Next: <code>{escape_html(next_run)}</code>",
+                    f"Prompt: <code>{escape_html(str(job.get('prompt') or '')[:120])}</code>",
+                ]
+            )
+        return "\n".join(lines)
 
     def handle_callback_query(self, callback_query: dict[str, Any]) -> None:
         callback_query_id = str(callback_query.get("id") or "")
@@ -899,9 +1126,14 @@ class CodexTelegramBridge:
                 "last_prompt": None,
                 "model": None,
                 "reasoning_effort": None,
+                "cron_jobs": [],
             }
             self.chat_sessions[chat_id] = session
             self._save_state()
+        else:
+            session.setdefault("model", None)
+            session.setdefault("reasoning_effort", None)
+            session.setdefault("cron_jobs", [])
         return session
 
     def update_chat_session(self, chat_id: str, *, thread_id: str, last_prompt: str | None = None) -> None:
@@ -910,6 +1142,20 @@ class CodexTelegramBridge:
         session["updated_at"] = utc_now()
         if last_prompt is not None:
             session["last_prompt"] = (last_prompt.strip().splitlines()[0][:160] or None)
+        self.chat_sessions[chat_id] = session
+        self._save_state()
+
+    def get_chat_cron_jobs(self, chat_id: str) -> list[dict[str, Any]]:
+        session = self.get_or_create_chat_session(chat_id)
+        jobs = session.get("cron_jobs")
+        if isinstance(jobs, list):
+            return jobs
+        return []
+
+    def set_chat_cron_jobs(self, chat_id: str, jobs: list[dict[str, Any]]) -> None:
+        session = self.get_or_create_chat_session(chat_id)
+        session["cron_jobs"] = jobs
+        session["updated_at"] = utc_now()
         self.chat_sessions[chat_id] = session
         self._save_state()
 
@@ -935,6 +1181,21 @@ class CodexTelegramBridge:
 
     def get_effective_reasoning(self, chat_id: str) -> str:
         return self.get_selected_reasoning(chat_id) or DEFAULT_REASONING_LEVEL
+
+    def compute_next_run_iso(self, schedule: str) -> str:
+        tz = get_cron_timezone()
+        base = datetime.now(tz)
+        next_run = croniter(schedule, base).get_next(datetime)
+        return next_run.astimezone(UTC).replace(microsecond=0).isoformat()
+
+    def format_when(self, iso_value: str) -> str:
+        if not iso_value:
+            return "n/a"
+        try:
+            dt = parse_iso_datetime(iso_value).astimezone(get_cron_timezone())
+        except Exception:
+            return iso_value
+        return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
 
     def _typing_heartbeat(self, chat_id: str, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
@@ -967,8 +1228,91 @@ class CodexTelegramBridge:
 
         self.handle_command(chat_id, text, message_id)
 
+    def cron_scheduler_loop(self) -> None:
+        while True:
+            try:
+                self.check_due_crons()
+            except Exception as exc:
+                print(f"cron scheduler error: {exc}", flush=True)
+            time.sleep(max(5, CRON_POLL_SECONDS))
+
+    def check_due_crons(self) -> None:
+        with self.state_lock:
+            if self.active_job is not None:
+                return
+
+        now = utc_now_dt()
+        for chat_id in list(self.chat_sessions.keys()):
+            for job in self.get_chat_cron_jobs(chat_id):
+                if not job.get("enabled"):
+                    continue
+                next_run_at = str(job.get("next_run_at") or "").strip()
+                if not next_run_at:
+                    job["next_run_at"] = self.compute_next_run_iso(str(job.get("schedule") or ""))
+                    self.set_chat_cron_jobs(chat_id, self.get_chat_cron_jobs(chat_id))
+                    continue
+                if parse_iso_datetime(next_run_at) <= now:
+                    if self.try_start_cron_job(chat_id, job):
+                        return
+
+    def try_start_cron_job(self, chat_id: str, job: dict[str, Any]) -> bool:
+        with self.state_lock:
+            if self.active_job is not None:
+                return False
+            self.active_job = {
+                "chat_id": chat_id,
+                "message_id": 0,
+                "label": f"cron:{str(job.get('name') or job.get('id') or 'job')[:100]}",
+                "started_at": utc_now(),
+            }
+
+        thread = threading.Thread(
+            target=self.run_cron_job,
+            args=(chat_id, dict(job)),
+            daemon=True,
+        )
+        thread.start()
+        return True
+
+    def run_cron_job(self, chat_id: str, job: dict[str, Any]) -> None:
+        job_id = str(job.get("id") or "")
+        schedule = str(job.get("schedule") or "")
+        try:
+            jobs = self.get_chat_cron_jobs(chat_id)
+            for existing in jobs:
+                if existing.get("id") == job_id:
+                    existing["last_run_at"] = utc_now()
+                    existing["next_run_at"] = self.compute_next_run_iso(schedule)
+                    break
+            self.set_chat_cron_jobs(chat_id, jobs)
+
+            self.send_markdown(
+                chat_id,
+                "\n".join(
+                    [
+                        "<b>Running cron</b>",
+                        f"<b>Name:</b> <code>{escape_html(str(job.get('name') or job_id or 'cron'))}</code>",
+                        f"<b>Schedule:</b> <code>{escape_html(schedule)}</code>",
+                    ]
+                ),
+                already_formatted=True,
+            )
+            result = self.execute_codex(str(job.get("prompt") or ""), chat_id)
+            self.send_markdown(chat_id, result, already_formatted=False)
+        except Exception as exc:
+            self.send_markdown(
+                chat_id,
+                f"<b>Cron failed</b>\n{escape_html(str(exc))}",
+                already_formatted=True,
+            )
+        finally:
+            with self.state_lock:
+                self.active_job = None
+
     def run_forever(self) -> None:
         self.ensure_codex_current()
+        scheduler = threading.Thread(target=self.cron_scheduler_loop, daemon=True)
+        scheduler.start()
         while True:
             try:
                 updates = self.get_updates()
@@ -984,6 +1328,24 @@ class CodexTelegramBridge:
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+def utc_now_dt() -> datetime:
+    return datetime.now(UTC).replace(microsecond=0)
+
+
+def get_cron_timezone() -> ZoneInfo:
+    try:
+        return ZoneInfo(CRON_TIMEZONE)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def parse_iso_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def get_current_codex_version() -> str:
