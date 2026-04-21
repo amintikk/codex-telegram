@@ -528,7 +528,7 @@ class CodexTelegramBridge:
             final_message = extract_last_meaningful_text(process.stdout).strip()
 
         if process.returncode == 0:
-            self.set_chat_limit_state(chat_id, None)
+            self.set_chat_success_state(chat_id)
 
         if not final_message:
             if error_info:
@@ -585,6 +585,7 @@ class CodexTelegramBridge:
             message = "<b>Logged out</b>\nStored credentials for this chat were removed."
         else:
             message = "<b>Logout finished</b>\nNo active Codex session was found for this chat."
+        self.clear_chat_runtime_state(chat_id)
 
         self.send_markdown(chat_id, message, reply_to_message_id=message_id, already_formatted=True)
 
@@ -1388,13 +1389,36 @@ class CodexTelegramBridge:
     def format_limits(self, chat_id: str) -> str:
         session = self.get_or_create_chat_session(chat_id)
         limit_state = session.get("last_limit")
+        last_success_at = str(session.get("last_success_at") or "").strip()
         if isinstance(limit_state, dict) and str(limit_state.get("message") or "").strip():
+            observed_at = str(limit_state.get("observed_at") or "").strip()
+            if observed_at and last_success_at:
+                try:
+                    if parse_iso_datetime(last_success_at) > parse_iso_datetime(observed_at):
+                        lines = [
+                            "<b>Codex limits</b>",
+                            "<b>Status:</b> <code>ready</code>",
+                            f"<b>Last quota issue:</b> <code>{escape_html(self.format_when_utc(observed_at))}</code>",
+                            f"<b>Recovered at:</b> <code>{escape_html(self.format_when_utc(last_success_at))}</code>",
+                        ]
+                        retry_at = str(limit_state.get("retry_at") or "").strip()
+                        if retry_at:
+                            lines.append(f"<b>Last retry window:</b> <code>{escape_html(retry_at)}</code>")
+                        lines.extend(
+                            [
+                                "",
+                                "The latest Codex run for this chat completed successfully after the last quota issue.",
+                            ]
+                        )
+                        return "\n".join(lines)
+                except Exception:
+                    pass
+
             lines = [
                 "<b>Codex limits</b>",
                 "<b>Status:</b> <code>limit reached</code>",
             ]
             retry_at = str(limit_state.get("retry_at") or "").strip()
-            observed_at = str(limit_state.get("observed_at") or "").strip()
             if retry_at:
                 lines.append(f"<b>Retry after:</b> <code>{escape_html(retry_at)}</code>")
             if observed_at:
@@ -1409,12 +1433,23 @@ class CodexTelegramBridge:
             )
             return "\n".join(lines)
 
+        if last_success_at:
+            return "\n".join(
+                [
+                    "<b>Codex limits</b>",
+                    "<b>Status:</b> <code>ready</code>",
+                    f"<b>Last successful run:</b> <code>{escape_html(self.format_when_utc(last_success_at))}</code>",
+                    "",
+                    "No recent quota issue is stored for this chat.",
+                ]
+            )
+
         return "\n".join(
             [
                 "<b>Codex limits</b>",
-                "<b>Status:</b> <code>no recent limit detected</code>",
+                "<b>Status:</b> <code>no recent usage data</code>",
                 "",
-                "If this chat hits a quota wall later, the latest reset time will show up here.",
+                "Run a task first. If this chat hits a quota wall later, the latest reset time will show up here.",
             ]
         )
 
@@ -1429,6 +1464,7 @@ class CodexTelegramBridge:
                 "reasoning_effort": None,
                 "cron_jobs": [],
                 "last_limit": None,
+                "last_success_at": None,
             }
             self.chat_sessions[chat_id] = session
             self._save_state()
@@ -1438,6 +1474,7 @@ class CodexTelegramBridge:
             session.setdefault("cron_jobs", [])
             session.setdefault("cron_draft", None)
             session.setdefault("last_limit", None)
+            session.setdefault("last_success_at", None)
         return session
 
     def update_chat_session(self, chat_id: str, *, thread_id: str, last_prompt: str | None = None) -> None:
@@ -1624,6 +1661,21 @@ class CodexTelegramBridge:
     def set_chat_limit_state(self, chat_id: str, limit_state: dict[str, Any] | None) -> None:
         session = self.get_or_create_chat_session(chat_id)
         session["last_limit"] = limit_state
+        session["updated_at"] = utc_now()
+        self.chat_sessions[chat_id] = session
+        self._save_state()
+
+    def set_chat_success_state(self, chat_id: str) -> None:
+        session = self.get_or_create_chat_session(chat_id)
+        session["last_success_at"] = utc_now()
+        session["updated_at"] = utc_now()
+        self.chat_sessions[chat_id] = session
+        self._save_state()
+
+    def clear_chat_runtime_state(self, chat_id: str) -> None:
+        session = self.get_or_create_chat_session(chat_id)
+        session["last_limit"] = None
+        session["last_success_at"] = None
         session["updated_at"] = utc_now()
         self.chat_sessions[chat_id] = session
         self._save_state()
