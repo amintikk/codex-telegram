@@ -85,6 +85,7 @@ list all running docker containers on this machine
 | `/login cancel` | Cancel a pending login |
 | `/logout` | Remove stored credentials for this chat |
 | `/new` | Start a fresh Codex conversation |
+| `/limits` | Show the latest Codex quota state for this chat |
 | `/status` | Show bridge status |
 | `/cron` | View and manage scheduled tasks |
 | `/version` | Show installed Codex CLI version |

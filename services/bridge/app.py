@@ -35,6 +35,7 @@ THINKING_CHOICES = [
     ("high", "High"),
     ("xhigh", "XHigh"),
 ]
+USAGE_LIMIT_RE = re.compile(r"try again at (?P<when>.+?)(?:\.|$)", re.IGNORECASE)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 ALLOWED_CHAT_IDS = {
@@ -282,6 +283,7 @@ class CodexTelegramBridge:
                         "<code>/new</code> start a fresh Codex chat",
                         "<code>/model</code> choose model and thinking",
                         "<code>/cron</code> manage scheduled tasks",
+                        "<code>/limits</code> show the latest quota status for this chat",
                         "<code>/status</code> show runtime status",
                         "<code>/version</code> show installed Codex CLI version",
                         "<code>/update</code> force a Codex CLI update check",
@@ -295,6 +297,10 @@ class CodexTelegramBridge:
 
         if command == "/status":
             self.send_markdown(chat_id, self.format_status(chat_id), reply_to_message_id=message_id)
+            return
+
+        if command == "/limits":
+            self.send_markdown(chat_id, self.format_limits(chat_id), reply_to_message_id=message_id)
             return
 
         if command == "/version":
@@ -399,8 +405,13 @@ class CodexTelegramBridge:
 
         try:
             self.ensure_codex_current()
-            result = self.execute_codex(prompt, chat_id)
-            self.send_markdown(chat_id, result, reply_to_message_id=message_id, already_formatted=False)
+            result, already_formatted = self.execute_codex(prompt, chat_id)
+            self.send_markdown(
+                chat_id,
+                result,
+                reply_to_message_id=message_id,
+                already_formatted=already_formatted,
+            )
         except Exception as exc:
             self.send_markdown(
                 chat_id,
@@ -414,7 +425,7 @@ class CodexTelegramBridge:
             with self.state_lock:
                 self.active_job = None
 
-    def execute_codex(self, prompt: str, chat_id: str) -> str:
+    def execute_codex(self, prompt: str, chat_id: str) -> tuple[str, bool]:
         run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         last_message_file = RUNS_DIR / f"{run_id}-last-message.txt"
         events_file = RUNS_DIR / f"{run_id}-events.jsonl"
@@ -473,6 +484,17 @@ class CodexTelegramBridge:
         new_thread_id = extract_thread_id_from_output(process.stdout)
         if new_thread_id:
             self.update_chat_session(chat_id, thread_id=new_thread_id, last_prompt=prompt)
+        error_info = extract_codex_error(process.stdout)
+        if error_info and error_info["kind"] == "usage_limit":
+            limit_state = {
+                "kind": error_info["kind"],
+                "message": error_info["message"],
+                "retry_at": error_info.get("retry_at"),
+                "observed_at": utc_now(),
+            }
+            self.set_chat_limit_state(chat_id, limit_state)
+            return self.format_limit_reached_message(limit_state), True
+
         final_message = ""
         if last_message_file.exists():
             final_message = last_message_file.read_text(encoding="utf-8").strip()
@@ -480,15 +502,22 @@ class CodexTelegramBridge:
         if not final_message:
             final_message = extract_last_meaningful_text(process.stdout).strip()
 
+        if process.returncode == 0:
+            self.set_chat_limit_state(chat_id, None)
+
         if not final_message:
+            if error_info:
+                return self.format_codex_error_message(error_info), True
             final_message = "Codex finished without a final message."
 
         body = final_message
         if process.returncode != 0:
+            if error_info:
+                return self.format_codex_error_message(error_info), True
             tail = tail_text(process.stdout, 1200)
             body += "\n\nCommand output tail:\n" + tail
 
-        return body
+        return body, False
 
     def has_pending_login(self, chat_id: str) -> bool:
         with self.login_lock:
@@ -1331,6 +1360,39 @@ class CodexTelegramBridge:
         self.last_update_check = time.time()
         return get_current_codex_version()
 
+    def format_limits(self, chat_id: str) -> str:
+        session = self.get_or_create_chat_session(chat_id)
+        limit_state = session.get("last_limit")
+        if isinstance(limit_state, dict) and str(limit_state.get("message") or "").strip():
+            lines = [
+                "<b>Codex limits</b>",
+                "<b>Status:</b> <code>limit reached</code>",
+            ]
+            retry_at = str(limit_state.get("retry_at") or "").strip()
+            observed_at = str(limit_state.get("observed_at") or "").strip()
+            if retry_at:
+                lines.append(f"<b>Retry after:</b> <code>{escape_html(retry_at)}</code>")
+            if observed_at:
+                lines.append(f"<b>Last seen:</b> <code>{escape_html(self.format_when_utc(observed_at))}</code>")
+            lines.extend(
+                [
+                    "",
+                    escape_html(str(limit_state.get("message") or "")),
+                    "",
+                    "You can wait for the reset time or reconnect this chat with <code>/login</code>.",
+                ]
+            )
+            return "\n".join(lines)
+
+        return "\n".join(
+            [
+                "<b>Codex limits</b>",
+                "<b>Status:</b> <code>no recent limit detected</code>",
+                "",
+                "If this chat hits a quota wall later, the latest reset time will show up here.",
+            ]
+        )
+
     def get_or_create_chat_session(self, chat_id: str) -> dict[str, Any]:
         session = self.chat_sessions.get(chat_id)
         if session is None:
@@ -1341,6 +1403,7 @@ class CodexTelegramBridge:
                 "model": None,
                 "reasoning_effort": None,
                 "cron_jobs": [],
+                "last_limit": None,
             }
             self.chat_sessions[chat_id] = session
             self._save_state()
@@ -1349,6 +1412,7 @@ class CodexTelegramBridge:
             session.setdefault("reasoning_effort", None)
             session.setdefault("cron_jobs", [])
             session.setdefault("cron_draft", None)
+            session.setdefault("last_limit", None)
         return session
 
     def update_chat_session(self, chat_id: str, *, thread_id: str, last_prompt: str | None = None) -> None:
@@ -1532,6 +1596,13 @@ class CodexTelegramBridge:
         self.chat_sessions[chat_id] = session
         self._save_state()
 
+    def set_chat_limit_state(self, chat_id: str, limit_state: dict[str, Any] | None) -> None:
+        session = self.get_or_create_chat_session(chat_id)
+        session["last_limit"] = limit_state
+        session["updated_at"] = utc_now()
+        self.chat_sessions[chat_id] = session
+        self._save_state()
+
     def get_selected_model(self, chat_id: str) -> str | None:
         session = self.get_or_create_chat_session(chat_id)
         value = session.get("model")
@@ -1562,6 +1633,38 @@ class CodexTelegramBridge:
         except Exception:
             return iso_value
         return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    def format_when_utc(self, iso_value: str) -> str:
+        if not iso_value:
+            return "n/a"
+        try:
+            dt = parse_iso_datetime(iso_value).astimezone(UTC)
+        except Exception:
+            return iso_value
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    def format_limit_reached_message(self, limit_state: dict[str, Any]) -> str:
+        lines = [
+            "<b>Usage limit reached</b>",
+            "The Codex account connected to this chat has reached its current usage limit.",
+        ]
+        retry_at = str(limit_state.get("retry_at") or "").strip()
+        if retry_at:
+            lines.append(f"<b>Retry after:</b> <code>{escape_html(retry_at)}</code>")
+        lines.extend(
+            [
+                "",
+                "Use <code>/limits</code> to check the latest limit state or <code>/login</code> to connect a different account.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def format_codex_error_message(self, error_info: dict[str, str]) -> str:
+        lines = ["<b>Codex error</b>", escape_html(error_info.get("message") or "Codex returned an error.")]
+        retry_at = str(error_info.get("retry_at") or "").strip()
+        if retry_at:
+            lines.append(f"<b>Retry after:</b> <code>{escape_html(retry_at)}</code>")
+        return "\n".join(lines)
 
     def _typing_heartbeat(self, chat_id: str, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
@@ -1666,8 +1769,8 @@ class CodexTelegramBridge:
                 ),
                 already_formatted=True,
             )
-            result = self.execute_codex(str(job.get("prompt") or ""), chat_id)
-            self.send_markdown(chat_id, result, already_formatted=False)
+            result, already_formatted = self.execute_codex(str(job.get("prompt") or ""), chat_id)
+            self.send_markdown(chat_id, result, already_formatted=already_formatted)
         except Exception as exc:
             self.send_markdown(
                 chat_id,
@@ -1776,6 +1879,46 @@ def extract_last_meaningful_text(output: str) -> str:
                             return str(text)
 
     return "\n".join(lines[-20:])
+
+
+def extract_codex_error(output: str) -> dict[str, str] | None:
+    last_error = ""
+    retry_at = ""
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        message = ""
+        if payload.get("type") == "error":
+            message = str(payload.get("message") or "").strip()
+        elif payload.get("type") == "turn.failed":
+            error_payload = payload.get("error")
+            if isinstance(error_payload, dict):
+                message = str(error_payload.get("message") or "").strip()
+
+        if not message:
+            continue
+
+        last_error = message
+        retry_match = USAGE_LIMIT_RE.search(message)
+        if retry_match:
+            retry_at = retry_match.group("when").strip()
+
+    if not last_error:
+        return None
+
+    kind = "usage_limit" if "usage limit" in last_error.lower() else "generic"
+    return {
+        "kind": kind,
+        "message": last_error,
+        "retry_at": retry_at,
+    }
 
 
 def extract_thread_id_from_output(output: str) -> str:
