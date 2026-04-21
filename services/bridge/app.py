@@ -85,6 +85,7 @@ class CodexTelegramBridge:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         CODEX_AUTH_ROOT.mkdir(parents=True, exist_ok=True)
         self._load_state()
+        self.register_bot_commands()
 
     def _load_state(self) -> None:
         if not STATE_FILE.exists():
@@ -210,6 +211,30 @@ class CodexTelegramBridge:
             },
         )
         return response.get("result", [])
+
+    def register_bot_commands(self) -> None:
+        commands = [
+            {"command": "login", "description": "Connect Codex for this chat"},
+            {"command": "logout", "description": "Remove stored credentials"},
+            {"command": "new", "description": "Start a fresh Codex chat"},
+            {"command": "model", "description": "Choose model and thinking"},
+            {"command": "cron", "description": "Manage scheduled tasks"},
+            {"command": "limits", "description": "Show the latest quota status"},
+            {"command": "status", "description": "Show bridge status"},
+            {"command": "version", "description": "Show installed Codex version"},
+            {"command": "update", "description": "Force a Codex update check"},
+            {"command": "run", "description": "Run a task explicitly"},
+            {"command": "help", "description": "Show quick help"},
+        ]
+        try:
+            self._telegram(
+                "setMyCommands",
+                data={
+                    "commands": json.dumps(commands),
+                },
+            )
+        except Exception:
+            pass
 
     def ensure_codex_current(self) -> str:
         current = get_current_codex_version()
@@ -2025,7 +2050,7 @@ def build_telegram_fragments(text: str, limit: int = 3800) -> list[str]:
     total = len(rendered_segments)
     fragments: list[str] = []
     for index, segment in enumerate(rendered_segments, start=1):
-        prefix = f"<b>Parte {index}/{total}</b>\n"
+        prefix = f"<b>Part {index}/{total}</b>\n"
         if len(prefix) + len(segment) <= limit:
             fragments.append(prefix + segment)
             continue
