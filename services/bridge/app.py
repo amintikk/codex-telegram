@@ -432,7 +432,6 @@ class CodexTelegramBridge:
                 "--json",
                 "-o",
                 str(last_message_file),
-                "--skip-git-repo-check",
             ]
             if effective_model:
                 command.extend(["-m", effective_model])
