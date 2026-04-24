@@ -29,6 +29,7 @@ It supports:
 - per-chat login with official device auth
 - persistent chat sessions with `/new`
 - image input from Telegram photos and image documents
+- live progress updates in a single Telegram message while Codex works
 - host workspace access
 - optional host Docker access
 - automatic Codex updates
@@ -87,6 +88,7 @@ list all running docker containers on this machine
 | `/login cancel` | Cancel a pending login |
 | `/logout` | Remove stored credentials for this chat |
 | `/new` | Start a fresh Codex conversation |
+| `/stop` | Stop the currently running Codex task |
 | `/limits` | Show the latest Codex quota state for this chat |
 | `/status` | Show bridge status |
 | `/cron` | View and manage scheduled tasks |

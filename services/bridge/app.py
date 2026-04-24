@@ -146,7 +146,12 @@ class CodexTelegramBridge:
         }
         if reply_markup is not None:
             data["reply_markup"] = json.dumps(reply_markup)
-        self._telegram("editMessageText", data=data)
+        try:
+            self._telegram("editMessageText", data=data)
+        except BotError as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            raise
 
     def send_markdown(
         self,
@@ -190,7 +195,7 @@ class CodexTelegramBridge:
         *,
         reply_to_message_id: int | None = None,
         reply_markup: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> int | None:
         data: dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
@@ -201,7 +206,10 @@ class CodexTelegramBridge:
             data["reply_to_message_id"] = reply_to_message_id
         if reply_markup is not None:
             data["reply_markup"] = json.dumps(reply_markup)
-        self._telegram("sendMessage", data=data)
+        response = self._telegram("sendMessage", data=data)
+        result = response.get("result") or {}
+        message_id = result.get("message_id")
+        return int(message_id) if message_id else None
 
     def get_updates(self) -> list[dict[str, Any]]:
         response = self._telegram(
@@ -268,6 +276,7 @@ class CodexTelegramBridge:
             {"command": "login", "description": "Connect Codex for this chat"},
             {"command": "logout", "description": "Remove stored credentials"},
             {"command": "new", "description": "Start a fresh Codex chat"},
+            {"command": "stop", "description": "Stop the running Codex task"},
             {"command": "model", "description": "Choose model and thinking"},
             {"command": "cron", "description": "Manage scheduled tasks"},
             {"command": "limits", "description": "Show the latest quota status"},
@@ -358,6 +367,7 @@ class CodexTelegramBridge:
                         "<code>/login cancel</code> cancel device auth",
                         "<code>/logout</code> remove stored credentials for this chat",
                         "<code>/new</code> start a fresh Codex chat",
+                        "<code>/stop</code> stop the current Codex task",
                         "<code>/model</code> choose model and thinking",
                         "<code>/cron</code> manage scheduled tasks",
                         "<code>/limits</code> show the latest quota status for this chat",
@@ -412,6 +422,10 @@ class CodexTelegramBridge:
             self.handle_new_command(chat_id, message_id)
             return
 
+        if command == "/stop":
+            self.handle_stop_command(chat_id, message_id)
+            return
+
         if command == "/model":
             self.handle_model_command(chat_id, message_id)
             return
@@ -445,6 +459,7 @@ class CodexTelegramBridge:
         image_paths = image_paths or []
         with self.state_lock:
             if self.active_job is not None:
+                self.cleanup_image_paths(image_paths)
                 self.send_markdown(
                     chat_id,
                     "<b>Busy</b>\nAnother task is still running.",
@@ -454,6 +469,7 @@ class CodexTelegramBridge:
                 return
 
             if self.has_pending_login(chat_id):
+                self.cleanup_image_paths(image_paths)
                 self.send_markdown(
                     chat_id,
                     "<b>Login in progress</b>\nFinish the device login first or use <code>/login cancel</code>.",
@@ -464,6 +480,7 @@ class CodexTelegramBridge:
 
             logged_in, _ = self.get_login_status(chat_id)
             if not logged_in:
+                self.cleanup_image_paths(image_paths)
                 self.send_markdown(
                     chat_id,
                     "<b>Login required</b>\nUse <code>/login</code> to connect Codex for this chat before running tasks.",
@@ -488,10 +505,23 @@ class CodexTelegramBridge:
             daemon=True,
         )
         typing_thread.start()
+        progress_message_id = self.send_panel(
+            chat_id,
+            self.build_progress_text([], "Working"),
+            reply_to_message_id=message_id,
+        )
+        with self.state_lock:
+            if self.active_job is not None:
+                self.active_job["progress_message_id"] = progress_message_id
 
         try:
             self.ensure_codex_current()
-            result, already_formatted = self.execute_codex(prompt, chat_id, image_paths=image_paths)
+            result, already_formatted = self.execute_codex(
+                prompt,
+                chat_id,
+                image_paths=image_paths,
+                progress_message_id=progress_message_id,
+            )
             self.send_markdown(
                 chat_id,
                 result,
@@ -505,16 +535,18 @@ class CodexTelegramBridge:
                 reply_to_message_id=message_id,
                 already_formatted=True,
             )
+            if progress_message_id:
+                self.edit_message(
+                    chat_id,
+                    progress_message_id,
+                    self.build_progress_text([], "Failed"),
+                )
         finally:
             typing_stop.set()
             typing_thread.join(timeout=1)
             with self.state_lock:
                 self.active_job = None
-            for image_path in image_paths:
-                try:
-                    image_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+            self.cleanup_image_paths(image_paths)
 
     def execute_codex(
         self,
@@ -522,6 +554,7 @@ class CodexTelegramBridge:
         chat_id: str,
         *,
         image_paths: list[Path] | None = None,
+        progress_message_id: int | None = None,
     ) -> tuple[str, bool]:
         image_paths = image_paths or []
         run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
@@ -571,22 +604,42 @@ class CodexTelegramBridge:
             command.extend(CODEX_EXTRA_ARGS)
             command.append(prompt)
 
-        with output_file.open("w", encoding="utf-8") as output_handle:
-            process = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=False,
-                env=self.build_codex_env(chat_id),
-            )
-            output_handle.write(process.stdout)
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            env=self.build_codex_env(chat_id),
+        )
+        with self.state_lock:
+            if self.active_job is not None and str(self.active_job.get("chat_id") or "") == chat_id:
+                self.active_job["process"] = process
+                if self.active_job.get("stop_requested"):
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
 
-        events_file.write_text(process.stdout, encoding="utf-8")
-        new_thread_id = extract_thread_id_from_output(process.stdout)
+        output_lines: list[str] = []
+        progress_state = self.create_progress_state(chat_id, progress_message_id)
+        with output_file.open("w", encoding="utf-8") as output_handle:
+            if process.stdout is not None:
+                for raw_line in process.stdout:
+                    output_handle.write(raw_line)
+                    output_lines.append(raw_line)
+                    self.handle_progress_stream_line(progress_state, raw_line)
+
+        return_code = process.wait()
+        self.flush_progress_state(progress_state, force=True)
+        stdout_text = "".join(output_lines)
+        events_file.write_text(stdout_text, encoding="utf-8")
+        new_thread_id = extract_thread_id_from_output(stdout_text)
         if new_thread_id:
             self.update_chat_session(chat_id, thread_id=new_thread_id, last_prompt=prompt)
-        error_info = extract_codex_error(process.stdout)
+        error_info = extract_codex_error(stdout_text)
+        stopped = self.was_stop_requested(chat_id)
         if error_info and error_info["kind"] == "usage_limit":
             limit_state = {
                 "kind": error_info["kind"],
@@ -595,6 +648,7 @@ class CodexTelegramBridge:
                 "observed_at": utc_now(),
             }
             self.set_chat_limit_state(chat_id, limit_state)
+            self.finish_progress_state(progress_state, "Usage limit")
             return self.format_limit_reached_message(limit_state), True
 
         final_message = ""
@@ -602,23 +656,32 @@ class CodexTelegramBridge:
             final_message = last_message_file.read_text(encoding="utf-8").strip()
 
         if not final_message:
-            final_message = extract_last_meaningful_text(process.stdout).strip()
+            final_message = extract_last_meaningful_text(stdout_text).strip()
 
-        if process.returncode == 0:
+        if return_code == 0:
             self.set_chat_success_state(chat_id)
+
+        if stopped:
+            self.finish_progress_state(progress_state, "Stopped")
+            return "<b>Stopped</b>\nThe running Codex task was cancelled.", True
 
         if not final_message:
             if error_info:
+                self.finish_progress_state(progress_state, "Failed")
                 return self.format_codex_error_message(error_info), True
             final_message = "Codex finished without a final message."
 
         body = final_message
-        if process.returncode != 0:
+        if return_code != 0:
             if error_info:
+                self.finish_progress_state(progress_state, "Failed")
                 return self.format_codex_error_message(error_info), True
-            tail = tail_text(process.stdout, 1200)
+            tail = tail_text(stdout_text, 1200)
             body += "\n\nCommand output tail:\n" + tail
+            self.finish_progress_state(progress_state, "Failed")
+            return body, False
 
+        self.finish_progress_state(progress_state, "Completed")
         return body, False
 
     def has_pending_login(self, chat_id: str) -> bool:
@@ -687,6 +750,52 @@ class CodexTelegramBridge:
         self.send_markdown(
             chat_id,
             "<b>New chat ready</b>\nThe next message will start with a fresh Codex context.",
+            reply_to_message_id=message_id,
+            already_formatted=True,
+        )
+
+    def handle_stop_command(self, chat_id: str, message_id: int) -> None:
+        with self.state_lock:
+            active_job = dict(self.active_job) if self.active_job else None
+            if active_job is None:
+                self.send_markdown(
+                    chat_id,
+                    "<b>No running task</b>",
+                    reply_to_message_id=message_id,
+                    already_formatted=True,
+                )
+                return
+
+            if str(active_job.get("chat_id") or "") != chat_id:
+                self.send_markdown(
+                    chat_id,
+                    "<b>Busy</b>\nAnother chat owns the running task right now.",
+                    reply_to_message_id=message_id,
+                    already_formatted=True,
+                )
+                return
+
+            process = active_job.get("process")
+            if self.active_job is not None:
+                self.active_job["stop_requested"] = True
+
+        if process is None:
+            self.send_markdown(
+                chat_id,
+                "<b>Stopping</b>\nThe task is still starting. It will stop as soon as the process is ready.",
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return
+
+        try:
+            process.terminate()
+        except Exception:
+            pass
+
+        self.send_markdown(
+            chat_id,
+            "<b>Stopping</b>\nSent a stop signal to the running Codex task.",
             reply_to_message_id=message_id,
             already_formatted=True,
         )
@@ -1820,6 +1929,135 @@ class CodexTelegramBridge:
             lines.append(f"<b>Retry after:</b> <code>{escape_html(retry_at)}</code>")
         return "\n".join(lines)
 
+    def cleanup_image_paths(self, image_paths: list[Path]) -> None:
+        for image_path in image_paths:
+            try:
+                image_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def create_progress_state(self, chat_id: str, message_id: int | None) -> dict[str, Any]:
+        return {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "lines": [],
+            "last_render_at": 0.0,
+        }
+
+    def build_progress_text(self, lines: list[str], status: str) -> str:
+        rendered_lines = lines[-12:] if lines else ["⏳ preparing..."]
+        return "\n".join(
+            [
+                f"<b>{escape_html(status)}</b>",
+                "",
+                *rendered_lines,
+            ]
+        )
+
+    def append_progress_line(self, progress_state: dict[str, Any], line: str) -> None:
+        clean = str(line or "").strip()
+        if not clean:
+            return
+        progress_state["lines"].append(clean)
+        progress_state["lines"] = progress_state["lines"][-20:]
+
+    def flush_progress_state(self, progress_state: dict[str, Any], *, force: bool = False, status: str = "Working") -> None:
+        message_id = progress_state.get("message_id")
+        chat_id = progress_state.get("chat_id")
+        if not message_id or not chat_id:
+            return
+        now = time.time()
+        if not force and now - float(progress_state.get("last_render_at") or 0.0) < 0.8:
+            return
+        self.edit_message(
+            str(chat_id),
+            int(message_id),
+            self.build_progress_text(list(progress_state.get("lines") or []), status),
+        )
+        progress_state["last_render_at"] = now
+
+    def finish_progress_state(self, progress_state: dict[str, Any], status: str) -> None:
+        self.flush_progress_state(progress_state, force=True, status=status)
+
+    def was_stop_requested(self, chat_id: str) -> bool:
+        with self.state_lock:
+            if self.active_job is None:
+                return False
+            if str(self.active_job.get("chat_id") or "") != chat_id:
+                return False
+            return bool(self.active_job.get("stop_requested"))
+
+    def handle_progress_stream_line(self, progress_state: dict[str, Any], raw_line: str) -> None:
+        line = raw_line.strip()
+        if not line:
+            return
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return
+
+        rendered = self.format_progress_event(payload)
+        if not rendered:
+            return
+        self.append_progress_line(progress_state, rendered)
+        self.flush_progress_state(progress_state)
+
+    def format_progress_event(self, payload: dict[str, Any]) -> str:
+        event_type = str(payload.get("type") or "").strip()
+        if event_type == "thread.started":
+            thread_id = str(payload.get("thread_id") or "").strip()
+            short_id = thread_id[:12] if thread_id else "new thread"
+            return f"🧵 thread started: <code>{escape_html(short_id)}</code>"
+
+        if event_type == "turn.started":
+            return "⚙️ turn started"
+
+        if event_type in {"error", "turn.failed"}:
+            message = ""
+            if event_type == "error":
+                message = str(payload.get("message") or "").strip()
+            else:
+                error_payload = payload.get("error")
+                if isinstance(error_payload, dict):
+                    message = str(error_payload.get("message") or "").strip()
+            if message:
+                return f"⚠️ {escape_html(shorten_text(message, 140))}"
+            return "⚠️ task failed"
+
+        if event_type == "item.started":
+            item = payload.get("item") or {}
+            item_type = str(item.get("type") or "").strip()
+            if item_type == "command_execution":
+                command = str(item.get("command") or "").strip()
+                return f"🖥️ run: <code>{escape_html(shorten_command(command, 110))}</code>"
+            return None
+
+        if event_type == "item.completed":
+            item = payload.get("item") or {}
+            item_type = str(item.get("type") or "").strip()
+            if item_type == "agent_message":
+                text = str(item.get("text") or "").strip()
+                if text:
+                    return f"💬 {escape_html(shorten_text(first_visible_line(text), 140))}"
+                return None
+            if item_type == "command_execution":
+                command = str(item.get("command") or "").strip()
+                exit_code = item.get("exit_code")
+                status = str(item.get("status") or "").strip()
+                if status == "failed" or (isinstance(exit_code, int) and exit_code != 0):
+                    return f"⚠️ exit {escape_html(str(exit_code))}: <code>{escape_html(shorten_command(command, 90))}</code>"
+                return f"✅ done: <code>{escape_html(shorten_command(command, 90))}</code>"
+            return None
+
+        if event_type == "turn.completed":
+            usage = payload.get("usage") or {}
+            output_tokens = usage.get("output_tokens")
+            if output_tokens is not None:
+                return f"✅ turn completed: <code>{escape_html(str(output_tokens))}</code> output tokens"
+            return "✅ turn completed"
+
+        return None
+
     def _typing_heartbeat(self, chat_id: str, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
             try:
@@ -1934,6 +2172,7 @@ class CodexTelegramBridge:
     def run_cron_job(self, chat_id: str, job: dict[str, Any]) -> None:
         job_id = str(job.get("id") or "")
         schedule = str(job.get("schedule") or "")
+        progress_message_id = None
         try:
             jobs = self.get_chat_cron_jobs(chat_id)
             for existing in jobs:
@@ -1943,18 +2182,25 @@ class CodexTelegramBridge:
                     break
             self.set_chat_cron_jobs(chat_id, jobs)
 
-            self.send_markdown(
+            progress_message_id = self.send_panel(
                 chat_id,
-                "\n".join(
+                self.build_progress_text(
                     [
-                        "<b>Running cron</b>",
-                        f"<b>Name:</b> <code>{escape_html(str(job.get('name') or job_id or 'cron'))}</code>",
-                        f"<b>Schedule:</b> <code>{escape_html(schedule)}</code>",
-                    ]
+                        f"⏰ cron: <code>{escape_html(str(job.get('name') or job_id or 'cron'))}</code>",
+                        f"🗓️ schedule: <code>{escape_html(schedule)}</code>",
+                    ],
+                    "Running cron",
                 ),
-                already_formatted=True,
             )
-            result, already_formatted = self.execute_codex(str(job.get("prompt") or ""), chat_id)
+            with self.state_lock:
+                if self.active_job is not None:
+                    self.active_job["progress_message_id"] = progress_message_id
+
+            result, already_formatted = self.execute_codex(
+                str(job.get("prompt") or ""),
+                chat_id,
+                progress_message_id=progress_message_id,
+            )
             self.send_markdown(chat_id, result, already_formatted=already_formatted)
         except Exception as exc:
             self.send_markdown(
@@ -1962,6 +2208,15 @@ class CodexTelegramBridge:
                 f"<b>Cron failed</b>\n{escape_html(str(exc))}",
                 already_formatted=True,
             )
+            if progress_message_id:
+                self.edit_message(
+                    chat_id,
+                    progress_message_id,
+                    self.build_progress_text(
+                        [f"⏰ cron: <code>{escape_html(str(job.get('name') or job_id or 'cron'))}</code>"],
+                        "Cron failed",
+                    ),
+                )
         finally:
             with self.state_lock:
                 self.active_job = None
@@ -2334,6 +2589,29 @@ def html_to_plain_text(value: str) -> str:
     text = re.sub(r"</?(b|i|u|strong|em)>", "", text)
     text = re.sub(r"<[^>]+>", "", text)
     return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+def first_visible_line(value: str) -> str:
+    for line in str(value or "").splitlines():
+        clean = line.strip()
+        if clean:
+            return clean
+    return ""
+
+
+def shorten_text(value: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def shorten_command(command: str, limit: int) -> str:
+    compact = re.sub(r"\s+", " ", str(command or "").strip())
+    if compact.startswith("/bin/bash -lc "):
+        compact = compact[len("/bin/bash -lc ") :].strip()
+    compact = compact.strip("'").strip('"')
+    return shorten_text(compact, limit)
 
 
 def main() -> None:
