@@ -61,6 +61,7 @@ CRON_POLL_SECONDS = int(os.environ.get("CRON_POLL_SECONDS", "15").strip() or "15
 CRON_TIMEZONE = os.environ.get("CRON_TIMEZONE", "UTC").strip() or "UTC"
 RUNS_DIR = Path(os.environ.get("RUNS_DIR", "/data/runs"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/state.json"))
+TELEGRAM_UPLOADS_DIR = Path(os.environ.get("TELEGRAM_UPLOADS_DIR", "/data/telegram-uploads"))
 
 
 class BotError(RuntimeError):
@@ -82,6 +83,7 @@ class CodexTelegramBridge:
         self.state_lock = threading.Lock()
         self.login_lock = threading.Lock()
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        TELEGRAM_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         CODEX_AUTH_ROOT.mkdir(parents=True, exist_ok=True)
         self._load_state()
@@ -212,6 +214,55 @@ class CodexTelegramBridge:
         )
         return response.get("result", [])
 
+    def get_telegram_file_path(self, file_id: str) -> str:
+        response = self._telegram("getFile", data={"file_id": file_id})
+        result = response.get("result") or {}
+        file_path = str(result.get("file_path") or "").strip()
+        if not file_path:
+            raise BotError("Telegram did not return a downloadable file path.")
+        return file_path
+
+    def download_telegram_file(self, file_path: str, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        file_url = f"{TELEGRAM_API_BASE}/file/bot{BOT_TOKEN}/{file_path}"
+        response = self.session.get(file_url, timeout=120)
+        response.raise_for_status()
+        destination.write_bytes(response.content)
+
+    def resolve_message_image(self, message: dict[str, Any]) -> tuple[Path | None, str | None]:
+        photo_sizes = message.get("photo")
+        if isinstance(photo_sizes, list) and photo_sizes:
+            best = max(
+                (item for item in photo_sizes if isinstance(item, dict)),
+                key=lambda item: int(item.get("file_size") or 0),
+                default=None,
+            )
+            if best:
+                file_id = str(best.get("file_id") or "").strip()
+                if file_id:
+                    file_path = self.get_telegram_file_path(file_id)
+                    suffix = Path(file_path).suffix or ".jpg"
+                    destination = TELEGRAM_UPLOADS_DIR / f"{uuid.uuid4().hex}{suffix}"
+                    self.download_telegram_file(file_path, destination)
+                    return destination, "photo"
+
+        document = message.get("document")
+        if isinstance(document, dict):
+            mime_type = str(document.get("mime_type") or "").lower()
+            file_name = str(document.get("file_name") or "")
+            suffix = Path(file_name).suffix.lower()
+            is_image = mime_type.startswith("image/") or suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+            if is_image:
+                file_id = str(document.get("file_id") or "").strip()
+                if file_id:
+                    file_path = self.get_telegram_file_path(file_id)
+                    final_suffix = Path(file_path).suffix or suffix or ".img"
+                    destination = TELEGRAM_UPLOADS_DIR / f"{uuid.uuid4().hex}{final_suffix}"
+                    self.download_telegram_file(file_path, destination)
+                    return destination, "document"
+
+        return None, None
+
     def register_bot_commands(self) -> None:
         commands = [
             {"command": "login", "description": "Connect Codex for this chat"},
@@ -299,6 +350,7 @@ class CodexTelegramBridge:
                     [
                         "<b>Codex Telegram Bridge</b>",
                         "Send any message and it will be forwarded to Codex CLI.",
+                        "You can also send a photo or image document, with or without a caption.",
                         "",
                         "<b>Commands</b>",
                         "<code>/login</code> connect Codex for this chat",
@@ -382,7 +434,15 @@ class CodexTelegramBridge:
 
         self.run_prompt(chat_id, text, message_id)
 
-    def run_prompt(self, chat_id: str, prompt: str, message_id: int) -> None:
+    def run_prompt(
+        self,
+        chat_id: str,
+        prompt: str,
+        message_id: int,
+        *,
+        image_paths: list[Path] | None = None,
+    ) -> None:
+        image_paths = image_paths or []
         with self.state_lock:
             if self.active_job is not None:
                 self.send_markdown(
@@ -412,7 +472,8 @@ class CodexTelegramBridge:
                 )
                 return
 
-            label = prompt.strip().splitlines()[0][:100] or "task"
+            label_source = prompt.strip().splitlines()[0][:100] or ("image task" if image_paths else "task")
+            label = label_source
             self.active_job = {
                 "chat_id": chat_id,
                 "message_id": message_id,
@@ -430,7 +491,7 @@ class CodexTelegramBridge:
 
         try:
             self.ensure_codex_current()
-            result, already_formatted = self.execute_codex(prompt, chat_id)
+            result, already_formatted = self.execute_codex(prompt, chat_id, image_paths=image_paths)
             self.send_markdown(
                 chat_id,
                 result,
@@ -449,8 +510,20 @@ class CodexTelegramBridge:
             typing_thread.join(timeout=1)
             with self.state_lock:
                 self.active_job = None
+            for image_path in image_paths:
+                try:
+                    image_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-    def execute_codex(self, prompt: str, chat_id: str) -> tuple[str, bool]:
+    def execute_codex(
+        self,
+        prompt: str,
+        chat_id: str,
+        *,
+        image_paths: list[Path] | None = None,
+    ) -> tuple[str, bool]:
+        image_paths = image_paths or []
         run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         last_message_file = RUNS_DIR / f"{run_id}-last-message.txt"
         events_file = RUNS_DIR / f"{run_id}-events.jsonl"
@@ -473,6 +546,8 @@ class CodexTelegramBridge:
                 command.extend(["-m", effective_model])
             if selected_reasoning:
                 command.extend(["-c", f'{MODEL_REASONING_CONFIG_KEY}="{selected_reasoning}"'])
+            for image_path in image_paths:
+                command.extend(["-i", str(image_path)])
             command.extend(CODEX_EXTRA_ARGS)
             command.extend([thread_id, prompt])
         else:
@@ -490,6 +565,8 @@ class CodexTelegramBridge:
                 command.extend(["-m", effective_model])
             if selected_reasoning:
                 command.extend(["-c", f'{MODEL_REASONING_CONFIG_KEY}="{selected_reasoning}"'])
+            for image_path in image_paths:
+                command.extend(["-i", str(image_path)])
 
             command.extend(CODEX_EXTRA_ARGS)
             command.append(prompt)
@@ -1765,17 +1842,48 @@ class CodexTelegramBridge:
         chat = message.get("chat") or {}
         chat_id = str(chat.get("id", ""))
         text = (message.get("text") or "").strip()
+        caption = (message.get("caption") or "").strip()
         message_id = int(message.get("message_id") or 0)
+        has_image_message = bool(message.get("photo")) or isinstance(message.get("document"), dict)
 
-        if not chat_id or not text:
+        if not chat_id:
             return
         if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
             return
 
-        if self.handle_cron_draft_input(chat_id, text, message_id):
+        if text and self.handle_cron_draft_input(chat_id, text, message_id):
             return
 
-        self.handle_command(chat_id, text, message_id)
+        if text:
+            self.handle_command(chat_id, text, message_id)
+            return
+
+        if not has_image_message:
+            return
+
+        image_path, image_kind = self.resolve_message_image(message)
+        if image_path is None:
+            self.send_markdown(
+                chat_id,
+                "<b>Unsupported file</b>\nSend a Telegram photo or an image document.",
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return
+
+        prompt = caption
+        if caption.startswith("/run "):
+            prompt = caption[5:].strip()
+        elif caption.startswith("/run"):
+            prompt = ""
+
+        if not prompt:
+            prompt = "Analyze the attached image."
+
+        if image_kind == "document" and not caption:
+            prompt = "Analyze the attached image document."
+
+        self.run_prompt(chat_id, prompt, message_id, image_paths=[image_path])
 
     def cron_scheduler_loop(self) -> None:
         while True:

@@ -28,6 +28,7 @@ It supports:
 
 - per-chat login with official device auth
 - persistent chat sessions with `/new`
+- image input from Telegram photos and image documents
 - host workspace access
 - optional host Docker access
 - automatic Codex updates
@@ -79,6 +80,7 @@ list all running docker containers on this machine
 | Command | Purpose |
 | --- | --- |
 | any plain message | Run the prompt through Codex |
+| photo or image document | Send the image to Codex, using the caption as the prompt when present |
 | `/run <prompt>` | Run a task explicitly |
 | `/login` | Start official Codex login for this chat |
 | `/login status` | Show login state |
