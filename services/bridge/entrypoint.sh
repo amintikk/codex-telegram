@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash.container
 set -euo pipefail
 
 if [[ ! -d "${RUNS_DIR:-/data/runs}" ]]; then

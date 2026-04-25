@@ -43,7 +43,8 @@ ALLOWED_CHAT_IDS = {
     for item in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",")
     if item.strip()
 }
-HOST_WORKSPACE = os.environ.get("HOST_WORKSPACE", "/host/home/ubuntu").strip() or "/host/home/ubuntu"
+HOST_WORKSPACE = os.environ.get("HOST_WORKSPACE", "/home/ubuntu").strip() or "/home/ubuntu"
+HOST_SHELL_MODE = os.environ.get("HOST_SHELL_MODE", "container").strip().lower() or "container"
 CODEX_CHANNEL = os.environ.get("CODEX_CHANNEL", "latest").strip() or "latest"
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "").strip()
 CODEX_AUTH_MODE = os.environ.get("CODEX_AUTH_MODE", "shared").strip().lower() or "shared"
@@ -330,6 +331,7 @@ class CodexTelegramBridge:
             "<b>Codex Telegram Bridge</b>",
             f"<b>Codex version:</b> <code>{escape_html(current or 'unknown')}</code>",
             f"<b>Workspace:</b> <code>{escape_html(HOST_WORKSPACE)}</code>",
+            f"<b>Host access:</b> <code>{'full' if HOST_SHELL_MODE == 'host' else 'workspace-only'}</code>",
             f"<b>Channel:</b> <code>{escape_html(CODEX_CHANNEL)}</code>",
             f"<b>Auth mode:</b> <code>{escape_html(CODEX_AUTH_MODE)}</code>",
             f"<b>Login:</b> <code>{'ready' if logged_in else 'required'}</code>",
@@ -1651,6 +1653,7 @@ class CodexTelegramBridge:
                 "cron_jobs": [],
                 "last_limit": None,
                 "last_success_at": None,
+                "workspace_root": HOST_WORKSPACE,
             }
             self.chat_sessions[chat_id] = session
             self._save_state()
@@ -1661,12 +1664,20 @@ class CodexTelegramBridge:
             session.setdefault("cron_draft", None)
             session.setdefault("last_limit", None)
             session.setdefault("last_success_at", None)
+            if str(session.get("workspace_root") or "") != HOST_WORKSPACE:
+                session["thread_id"] = None
+                session["last_prompt"] = None
+                session["workspace_root"] = HOST_WORKSPACE
+                session["updated_at"] = utc_now()
+                self.chat_sessions[chat_id] = session
+                self._save_state()
         return session
 
     def update_chat_session(self, chat_id: str, *, thread_id: str, last_prompt: str | None = None) -> None:
         session = self.get_or_create_chat_session(chat_id)
         session["thread_id"] = thread_id
         session["updated_at"] = utc_now()
+        session["workspace_root"] = HOST_WORKSPACE
         if last_prompt is not None:
             session["last_prompt"] = (last_prompt.strip().splitlines()[0][:160] or None)
         self.chat_sessions[chat_id] = session

@@ -4,10 +4,16 @@ services:
       context: ./services/bridge
     container_name: codex-telegram
     restart: unless-stopped
+    privileged: true
+    pid: host
+    ipc: host
+    network_mode: host
+    uts: host
     env_file:
       - .env
     environment:
-      HOST_WORKSPACE: ${HOST_WORKSPACE:-/host/home/ubuntu}
+      HOST_WORKSPACE: ${HOST_WORKSPACE:-/home/ubuntu}
+      HOST_SHELL_MODE: ${HOST_SHELL_MODE:-host}
       CODEX_CHANNEL: ${CODEX_CHANNEL:-latest}
       CODEX_MODEL: ${CODEX_MODEL:-}
       CODEX_AUTH_MODE: ${CODEX_AUTH_MODE:-shared}
@@ -19,9 +25,10 @@ services:
       TELEGRAM_POLL_SECONDS: ${TELEGRAM_POLL_SECONDS:-30}
       RUNS_DIR: /data/runs
       STATE_FILE: /data/state.json
-    working_dir: /host/home/ubuntu
+    working_dir: /home/ubuntu
     volumes:
-      - /home/ubuntu:/host/home/ubuntu
+      - /home/ubuntu:/home/ubuntu
+      - /:/hostfs
       - /var/run/docker.sock:/var/run/docker.sock
       - ${CODEX_CONFIG_DIR:-./shared-codex}:/root/.codex
       - ./data:/data

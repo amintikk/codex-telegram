@@ -5,7 +5,7 @@
 <h1 align="center">Codex Telegram Bridge</h1>
 
 <p align="center">
-  Official Codex CLI in Docker, controlled from Telegram.
+Official Codex CLI in Docker, controlled from Telegram.
 </p>
 
 <p align="center">
@@ -31,7 +31,8 @@ It supports:
 - image input from Telegram photos and image documents
 - live progress updates in a single Telegram message while Codex works
 - host workspace access
-- optional host Docker access
+- full host shell access when `HOST_SHELL_MODE=host`
+- host Docker access
 - automatic Codex updates
 
 ## Quick start
@@ -52,7 +53,8 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_ALLOWED_CHAT_IDS=your_chat_id
 CODEX_AUTH_MODE=per_chat
 CODEX_AUTH_ROOT=/data/auth
-HOST_WORKSPACE=/host/home/ubuntu
+HOST_WORKSPACE=/home/ubuntu
+HOST_SHELL_MODE=host
 CODEX_CHANNEL=latest
 ```
 
@@ -120,6 +122,7 @@ Use this only for a private single-operator setup.
 | `CODEX_AUTH_ROOT` | Root directory for per-chat auth |
 | `CODEX_CONFIG_DIR` | Shared Codex profile path |
 | `HOST_WORKSPACE` | Workspace path exposed inside the container |
+| `HOST_SHELL_MODE` | `host` to execute generated shell commands against the real host |
 | `CODEX_CHANNEL` | npm channel or exact version |
 | `CODEX_MODEL` | Optional model override |
 | `CODEX_EXTRA_ARGS` | Extra flags passed to `codex exec` |
@@ -171,6 +174,7 @@ This bot can be very powerful depending on what you mount.
 Be careful with:
 
 - `TELEGRAM_ALLOWED_CHAT_IDS`
+- `HOST_SHELL_MODE=host`
 - `/var/run/docker.sock`
 - shared Codex profiles
 - aggressive `CODEX_EXTRA_ARGS`
