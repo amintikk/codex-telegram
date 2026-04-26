@@ -327,27 +327,26 @@ class CodexTelegramBridge:
         current_model = self.get_effective_model(chat_id)
         current_reasoning = self.get_effective_reasoning(chat_id)
         cron_count = len(self.get_chat_cron_jobs(chat_id))
-        lines = [
-            "<b>Codex Telegram Bridge</b>",
-            f"<b>Codex version:</b> <code>{escape_html(current or 'unknown')}</code>",
-            f"<b>Workspace:</b> <code>{escape_html(HOST_WORKSPACE)}</code>",
-            f"<b>Host access:</b> <code>{'full' if HOST_SHELL_MODE == 'host' else 'workspace-only'}</code>",
-            f"<b>Channel:</b> <code>{escape_html(CODEX_CHANNEL)}</code>",
-            f"<b>Auth mode:</b> <code>{escape_html(CODEX_AUTH_MODE)}</code>",
-            f"<b>Login:</b> <code>{'ready' if logged_in else 'required'}</code>",
-            f"<b>Context:</b> <code>{'active' if has_active_context else 'fresh'}</code>",
-            f"<b>Model:</b> <code>{escape_html(current_model)}</code>",
-            f"<b>Thinking:</b> <code>{escape_html(current_reasoning)}</code>",
-            f"<b>Crons:</b> <code>{cron_count}</code>",
+        rows = [
+            ("Version", current or "unknown"),
+            ("Workspace", HOST_WORKSPACE),
+            ("Host", "full" if HOST_SHELL_MODE == "host" else "workspace-only"),
+            ("Channel", CODEX_CHANNEL),
+            ("Auth mode", CODEX_AUTH_MODE),
+            ("Login", "ready" if logged_in else "required"),
+            ("Context", "active" if has_active_context else "fresh"),
+            ("Model", current_model),
+            ("Thinking", current_reasoning),
+            ("Crons", str(cron_count)),
         ]
         if auth_text:
-            lines.append(f"<b>Session:</b> {escape_html(auth_text)}")
+            rows.append(("Session", auth_text))
         with self.state_lock:
             if self.active_job:
-                lines.append(f"<b>Running:</b> {escape_html(self.active_job['label'])}")
+                rows.append(("Running", self.active_job["label"]))
             else:
-                lines.append("<b>Running:</b> none")
-        return "\n".join(lines)
+                rows.append(("Running", "none"))
+        return self.render_panel("Codex Telegram Bridge", self.render_kv_block(rows))
 
     def handle_command(self, chat_id: str, text: str, message_id: int) -> None:
         command, _, remainder = text.partition(" ")
@@ -396,7 +395,7 @@ class CodexTelegramBridge:
             version = self.ensure_codex_current()
             self.send_markdown(
                 chat_id,
-                f"<b>Codex version:</b> <code>{escape_html(version)}</code>",
+                self.render_panel("Codex version", self.render_kv_block([("Version", version)])),
                 reply_to_message_id=message_id,
                 already_formatted=True,
             )
@@ -406,7 +405,10 @@ class CodexTelegramBridge:
             version = self.force_codex_update()
             self.send_markdown(
                 chat_id,
-                f"<b>Codex updated</b>\nCurrent version: <code>{escape_html(version)}</code>",
+                self.render_panel(
+                    "Codex updated",
+                    self.render_kv_block([("Version", version), ("Channel", CODEX_CHANNEL)]),
+                ),
                 reply_to_message_id=message_id,
                 already_formatted=True,
             )
@@ -1681,16 +1683,17 @@ class CodexTelegramBridge:
 
     def format_rate_limit_line(self, label: str, window: dict[str, Any] | None) -> str:
         if not isinstance(window, dict):
-            return f"<b>{escape_html(label)}:</b> <code>not available yet</code>"
+            return self.render_meter_block(label, None, "Not available yet")
 
         left_percent = float(window.get("left_percent") or 0.0)
         used_percent = float(window.get("used_percent") or 0.0)
         resets_at = int(window.get("resets_at") or 0)
         reset_text = self.format_rate_limit_reset(resets_at)
-        return (
-            f"<b>{escape_html(label)}:</b> "
-            f"<code>{left_percent:.0f}% left</code> "
-            f"(<code>{used_percent:.0f}% used</code>, resets <code>{escape_html(reset_text)}</code>)"
+        return self.render_meter_block(
+            label,
+            left_percent,
+            f"{left_percent:.0f}% left",
+            detail=f"used {used_percent:.0f}%   reset {reset_text}",
         )
 
     def format_rate_limit_reset(self, resets_at: int) -> str:
@@ -1711,89 +1714,79 @@ class CodexTelegramBridge:
             self.format_rate_limit_line("Weekly limit", live_windows.get(10080)),
         ]
         if live_observed_at:
-            live_lines.append(f"<b>Snapshot seen:</b> <code>{escape_html(self.format_when_utc(live_observed_at))}</code>")
+            live_lines.append(self.render_kv_block([("Snapshot seen", self.format_when_utc(live_observed_at))]))
 
         if isinstance(limit_state, dict) and str(limit_state.get("message") or "").strip():
             observed_at = str(limit_state.get("observed_at") or "").strip()
             if observed_at and last_success_at:
                 try:
                     if parse_iso_datetime(last_success_at) > parse_iso_datetime(observed_at):
-                        lines = [
-                            "<b>Codex limits</b>",
-                            "<b>Status:</b> <code>ready</code>",
-                            f"<b>Last quota issue:</b> <code>{escape_html(self.format_when_utc(observed_at))}</code>",
-                            f"<b>Recovered at:</b> <code>{escape_html(self.format_when_utc(last_success_at))}</code>",
+                        blocks = [
+                            self.render_kv_block(
+                                [
+                                    ("Status", "ready"),
+                                    ("Last quota issue", self.format_when_utc(observed_at)),
+                                    ("Recovered at", self.format_when_utc(last_success_at)),
+                                ]
+                            )
                         ]
-                        lines.extend(live_lines)
+                        blocks.extend(live_lines)
                         retry_at = str(limit_state.get("retry_at") or "").strip()
                         if retry_at:
-                            lines.append(f"<b>Last retry window:</b> <code>{escape_html(retry_at)}</code>")
-                        lines.extend(
-                            [
-                                "",
-                                "The latest Codex run for this chat completed successfully after the last quota issue.",
-                            ]
-                        )
-                        return "\n".join(lines)
+                            blocks.append(self.render_kv_block([("Last retry window", retry_at)]))
+                        blocks.append("The latest Codex run for this chat completed successfully after the last quota issue.")
+                        return self.render_panel("Codex limits", "\n\n".join(blocks))
                 except Exception:
                     pass
 
-            lines = [
-                "<b>Codex limits</b>",
-                "<b>Status:</b> <code>limit reached</code>",
+            blocks = [
+                self.render_kv_block([("Status", "limit reached")]),
             ]
-            lines.extend(live_lines)
+            blocks.extend(live_lines)
             retry_at = str(limit_state.get("retry_at") or "").strip()
             if retry_at:
-                lines.append(f"<b>Retry after:</b> <code>{escape_html(retry_at)}</code>")
+                blocks.append(self.render_kv_block([("Retry after", retry_at)]))
             if observed_at:
-                lines.append(f"<b>Last seen:</b> <code>{escape_html(self.format_when_utc(observed_at))}</code>")
-            lines.extend(
-                [
-                    "",
-                    escape_html(str(limit_state.get("message") or "")),
-                ]
-            )
-            return "\n".join(lines)
+                blocks.append(self.render_kv_block([("Last seen", self.format_when_utc(observed_at))]))
+            blocks.append(escape_html(str(limit_state.get("message") or "")))
+            return self.render_panel("Codex limits", "\n\n".join(blocks))
 
         if live_windows:
-            lines = [
-                "<b>Codex limits</b>",
-                "<b>Status:</b> <code>live</code>",
-            ]
+            blocks = [self.render_kv_block([("Status", "live")])]
             if last_success_at:
-                lines.append(f"<b>Last successful run:</b> <code>{escape_html(self.format_when_utc(last_success_at))}</code>")
-            lines.extend(live_lines)
-            lines.extend(
-                [
-                    "",
-                    "These numbers come from the latest Codex token-count event stored in the local session history.",
-                ]
-            )
-            return "\n".join(lines)
+                blocks.append(self.render_kv_block([("Last successful run", self.format_when_utc(last_success_at))]))
+            blocks.extend(live_lines)
+            blocks.append("These numbers come from the latest Codex token-count event stored in the local session history.")
+            return self.render_panel("Codex limits", "\n\n".join(blocks))
 
         if last_success_at:
-            return "\n".join(
-                [
-                    "<b>Codex limits</b>",
-                    "<b>Status:</b> <code>ready</code>",
-                    f"<b>Last successful run:</b> <code>{escape_html(self.format_when_utc(last_success_at))}</code>",
-                    "<b>5h limit:</b> <code>not available yet</code>",
-                    "<b>Weekly limit:</b> <code>not available yet</code>",
-                    "",
-                    "This chat has run Codex before, but no rate-limit snapshot was found yet in the local session history.",
-                ]
+            return self.render_panel(
+                "Codex limits",
+                "\n\n".join(
+                    [
+                        self.render_kv_block(
+                            [
+                                ("Status", "ready"),
+                                ("Last successful run", self.format_when_utc(last_success_at)),
+                            ]
+                        ),
+                        self.render_meter_block("5h limit", None, "Not available yet"),
+                        self.render_meter_block("Weekly limit", None, "Not available yet"),
+                        "This chat has run Codex before, but no rate-limit snapshot was found yet in the local session history.",
+                    ]
+                ),
             )
 
-        return "\n".join(
-            [
-                "<b>Codex limits</b>",
-                "<b>Status:</b> <code>unknown</code>",
-                "<b>5h limit:</b> <code>not available yet</code>",
-                "<b>Weekly limit:</b> <code>not available yet</code>",
-                "",
-                "Run Codex at least once in this chat. The bot reads the latest live snapshot from Codex session rollouts.",
-            ]
+        return self.render_panel(
+            "Codex limits",
+            "\n\n".join(
+                [
+                    self.render_kv_block([("Status", "unknown")]),
+                    self.render_meter_block("5h limit", None, "Not available yet"),
+                    self.render_meter_block("Weekly limit", None, "Not available yet"),
+                    "Run Codex at least once in this chat. The bot reads the latest live snapshot from Codex session rollouts.",
+                ]
+            ),
         )
 
     def get_or_create_chat_session(self, chat_id: str) -> dict[str, Any]:
@@ -2072,28 +2065,60 @@ class CodexTelegramBridge:
             return iso_value
         return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    def render_panel(self, title: str, body: str) -> str:
+        return f"<b>{escape_html(title)}</b>\n{body}"
+
+    def render_kv_block(self, rows: list[tuple[str, str]]) -> str:
+        safe_rows = [(str(label), str(value)) for label, value in rows if str(value).strip()]
+        if not safe_rows:
+            return ""
+        width = max(len(label) for label, _ in safe_rows)
+        lines = [f"{label.ljust(width)}  {value}" for label, value in safe_rows]
+        return "<pre>" + escape_html("\n".join(lines)) + "</pre>"
+
+    def render_bar(self, percent: float | None, width: int = 16) -> str:
+        if percent is None:
+            return "░" * width
+        normalized = max(0.0, min(100.0, percent))
+        filled = round((normalized / 100.0) * width)
+        filled = max(0, min(width, filled))
+        return ("█" * filled) + ("░" * (width - filled))
+
+    def render_meter_block(
+        self,
+        label: str,
+        percent: float | None,
+        summary: str,
+        *,
+        detail: str | None = None,
+    ) -> str:
+        bar = self.render_bar(percent)
+        lines = [f"{label:<12} [{bar}] {summary}"]
+        if detail:
+            lines.append(f"{'':<12} {detail}")
+        return "<pre>" + escape_html("\n".join(lines)) + "</pre>"
+
     def format_limit_reached_message(self, limit_state: dict[str, Any]) -> str:
         lines = [
-            "<b>Usage limit reached</b>",
+            self.render_kv_block([("Status", "usage limit reached")]),
             "The Codex account connected to this chat has reached its current usage limit.",
         ]
         retry_at = str(limit_state.get("retry_at") or "").strip()
         if retry_at:
-            lines.append(f"<b>Retry after:</b> <code>{escape_html(retry_at)}</code>")
+            lines.append(self.render_kv_block([("Retry after", retry_at)]))
         lines.extend(
             [
-                "",
                 "Use <code>/limits</code> to check the latest limit state or <code>/login</code> to connect a different account.",
             ]
         )
-        return "\n".join(lines)
+        return self.render_panel("Usage limit", "\n\n".join(lines))
 
     def format_codex_error_message(self, error_info: dict[str, str]) -> str:
-        lines = ["<b>Codex error</b>", escape_html(error_info.get("message") or "Codex returned an error.")]
+        lines = [escape_html(error_info.get("message") or "Codex returned an error.")]
         retry_at = str(error_info.get("retry_at") or "").strip()
         if retry_at:
-            lines.append(f"<b>Retry after:</b> <code>{escape_html(retry_at)}</code>")
-        return "\n".join(lines)
+            lines.append(self.render_kv_block([("Retry after", retry_at)]))
+        return self.render_panel("Codex error", "\n\n".join(lines))
 
     def cleanup_image_paths(self, image_paths: list[Path]) -> None:
         for image_path in image_paths:
@@ -2173,7 +2198,7 @@ class CodexTelegramBridge:
         if event_type == "thread.started":
             thread_id = str(payload.get("thread_id") or "").strip()
             short_id = thread_id[:12] if thread_id else "new thread"
-            return f"🧵 thread started: <code>{escape_html(short_id)}</code>"
+            return f"thread started: <code>{escape_html(short_id)}</code>"
 
         if event_type == "turn.started":
             return "⚙️ turn started"
@@ -2187,15 +2212,15 @@ class CodexTelegramBridge:
                 if isinstance(error_payload, dict):
                     message = str(error_payload.get("message") or "").strip()
             if message:
-                return f"⚠️ {escape_html(shorten_text(message, 140))}"
-            return "⚠️ task failed"
+                return f"error: {escape_html(shorten_text(message, 140))}"
+            return "task failed"
 
         if event_type == "item.started":
             item = payload.get("item") or {}
             item_type = str(item.get("type") or "").strip()
             if item_type == "command_execution":
                 command = str(item.get("command") or "").strip()
-                return f"🖥️ run: <code>{escape_html(shorten_command(command, 110))}</code>"
+                return f"run: <code>{escape_html(shorten_command(command, 110))}</code>"
             return None
 
         if event_type == "item.completed":
@@ -2211,16 +2236,16 @@ class CodexTelegramBridge:
                 exit_code = item.get("exit_code")
                 status = str(item.get("status") or "").strip()
                 if status == "failed" or (isinstance(exit_code, int) and exit_code != 0):
-                    return f"⚠️ exit {escape_html(str(exit_code))}: <code>{escape_html(shorten_command(command, 90))}</code>"
-                return f"✅ done: <code>{escape_html(shorten_command(command, 90))}</code>"
+                    return f"exit {escape_html(str(exit_code))}: <code>{escape_html(shorten_command(command, 90))}</code>"
+                return f"done: <code>{escape_html(shorten_command(command, 90))}</code>"
             return None
 
         if event_type == "turn.completed":
             usage = payload.get("usage") or {}
             output_tokens = usage.get("output_tokens")
             if output_tokens is not None:
-                return f"✅ turn completed: <code>{escape_html(str(output_tokens))}</code> output tokens"
-            return "✅ turn completed"
+                return f"turn completed: <code>{escape_html(str(output_tokens))}</code> output tokens"
+            return "turn completed"
 
         return None
 
@@ -2352,8 +2377,8 @@ class CodexTelegramBridge:
                 chat_id,
                 self.build_progress_text(
                     [
-                        f"⏰ cron: <code>{escape_html(str(job.get('name') or job_id or 'cron'))}</code>",
-                        f"🗓️ schedule: <code>{escape_html(schedule)}</code>",
+                        f"cron: <code>{escape_html(str(job.get('name') or job_id or 'cron'))}</code>",
+                        f"schedule: <code>{escape_html(schedule)}</code>",
                     ],
                     "Running cron",
                 ),
@@ -2379,7 +2404,7 @@ class CodexTelegramBridge:
                     chat_id,
                     progress_message_id,
                     self.build_progress_text(
-                        [f"⏰ cron: <code>{escape_html(str(job.get('name') or job_id or 'cron'))}</code>"],
+                        [f"cron: <code>{escape_html(str(job.get('name') or job_id or 'cron'))}</code>"],
                         "Cron failed",
                     ),
                 )
