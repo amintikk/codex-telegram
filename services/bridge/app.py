@@ -515,7 +515,23 @@ class CodexTelegramBridge:
         with self.state_lock:
             if self.active_job is not None:
                 self.active_job["progress_message_id"] = progress_message_id
+        worker = threading.Thread(
+            target=self._run_prompt_worker,
+            args=(chat_id, prompt, message_id, image_paths, progress_message_id, typing_stop, typing_thread),
+            daemon=True,
+        )
+        worker.start()
 
+    def _run_prompt_worker(
+        self,
+        chat_id: str,
+        prompt: str,
+        message_id: int,
+        image_paths: list[Path],
+        progress_message_id: int | None,
+        typing_stop: threading.Event,
+        typing_thread: threading.Thread,
+    ) -> None:
         try:
             self.ensure_codex_current()
             result, already_formatted = self.execute_codex(
