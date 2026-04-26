@@ -1557,6 +1557,9 @@ class CodexTelegramBridge:
             return CODEX_AUTH_ROOT / chat_id / "home"
         return Path(os.environ.get("HOME", "/root")).resolve()
 
+    def get_codex_home(self, chat_id: str) -> Path:
+        return self.get_auth_home(chat_id) / ".codex"
+
     def build_codex_env(self, chat_id: str) -> dict[str, str]:
         env = os.environ.copy()
         auth_home = self.get_auth_home(chat_id)
@@ -1590,10 +1593,126 @@ class CodexTelegramBridge:
         self.last_update_check = time.time()
         return get_current_codex_version()
 
+    def get_latest_rate_limit_snapshot(self, chat_id: str) -> dict[str, Any] | None:
+        sessions_dir = self.get_codex_home(chat_id) / "sessions"
+        if not sessions_dir.exists():
+            return None
+
+        try:
+            rollout_files = sorted(
+                (path for path in sessions_dir.rglob("rollout-*.jsonl") if path.is_file()),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            return None
+
+        for rollout_file in rollout_files[:20]:
+            snapshot = self.extract_rate_limit_snapshot_from_rollout(rollout_file)
+            if snapshot:
+                return snapshot
+        return None
+
+    def extract_rate_limit_snapshot_from_rollout(self, rollout_file: Path) -> dict[str, Any] | None:
+        latest_snapshot: dict[str, Any] | None = None
+        try:
+            with rollout_file.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    if entry.get("type") != "event_msg":
+                        continue
+                    payload = entry.get("payload") or {}
+                    if payload.get("type") != "token_count":
+                        continue
+                    rate_limits = payload.get("rate_limits")
+                    if not isinstance(rate_limits, dict):
+                        continue
+                    latest_snapshot = {
+                        "observed_at": str(entry.get("timestamp") or "").strip(),
+                        "rate_limits": rate_limits,
+                    }
+        except Exception:
+            return None
+        return latest_snapshot
+
+    def normalize_rate_limit_windows(self, snapshot: dict[str, Any] | None) -> dict[int, dict[str, Any]]:
+        if not isinstance(snapshot, dict):
+            return {}
+
+        rate_limits = snapshot.get("rate_limits") or {}
+        if not isinstance(rate_limits, dict):
+            return {}
+
+        windows: dict[int, dict[str, Any]] = {}
+        for key in ("primary", "secondary"):
+            window = rate_limits.get(key)
+            if not isinstance(window, dict):
+                continue
+            try:
+                window_minutes = int(window.get("window_minutes") or 0)
+            except Exception:
+                continue
+            if window_minutes <= 0:
+                continue
+
+            try:
+                used_percent = float(window.get("used_percent") or 0.0)
+            except Exception:
+                used_percent = 0.0
+            used_percent = max(0.0, min(100.0, used_percent))
+
+            try:
+                resets_at = int(window.get("resets_at") or 0)
+            except Exception:
+                resets_at = 0
+
+            windows[window_minutes] = {
+                "used_percent": used_percent,
+                "left_percent": max(0.0, 100.0 - used_percent),
+                "resets_at": resets_at,
+            }
+        return windows
+
+    def format_rate_limit_line(self, label: str, window: dict[str, Any] | None) -> str:
+        if not isinstance(window, dict):
+            return f"<b>{escape_html(label)}:</b> <code>not available yet</code>"
+
+        left_percent = float(window.get("left_percent") or 0.0)
+        used_percent = float(window.get("used_percent") or 0.0)
+        resets_at = int(window.get("resets_at") or 0)
+        reset_text = self.format_rate_limit_reset(resets_at)
+        return (
+            f"<b>{escape_html(label)}:</b> "
+            f"<code>{left_percent:.0f}% left</code> "
+            f"(<code>{used_percent:.0f}% used</code>, resets <code>{escape_html(reset_text)}</code>)"
+        )
+
+    def format_rate_limit_reset(self, resets_at: int) -> str:
+        if resets_at <= 0:
+            return "unknown"
+        dt = datetime.fromtimestamp(resets_at, tz=UTC)
+        return dt.strftime("%H:%M UTC on %d %b")
+
     def format_limits(self, chat_id: str) -> str:
         session = self.get_or_create_chat_session(chat_id)
         limit_state = session.get("last_limit")
         last_success_at = str(session.get("last_success_at") or "").strip()
+        live_snapshot = self.get_latest_rate_limit_snapshot(chat_id)
+        live_windows = self.normalize_rate_limit_windows(live_snapshot)
+        live_observed_at = str((live_snapshot or {}).get("observed_at") or "").strip()
+        live_lines = [
+            self.format_rate_limit_line("5h limit", live_windows.get(300)),
+            self.format_rate_limit_line("Weekly limit", live_windows.get(10080)),
+        ]
+        if live_observed_at:
+            live_lines.append(f"<b>Snapshot seen:</b> <code>{escape_html(self.format_when_utc(live_observed_at))}</code>")
+
         if isinstance(limit_state, dict) and str(limit_state.get("message") or "").strip():
             observed_at = str(limit_state.get("observed_at") or "").strip()
             if observed_at and last_success_at:
@@ -1605,6 +1724,7 @@ class CodexTelegramBridge:
                             f"<b>Last quota issue:</b> <code>{escape_html(self.format_when_utc(observed_at))}</code>",
                             f"<b>Recovered at:</b> <code>{escape_html(self.format_when_utc(last_success_at))}</code>",
                         ]
+                        lines.extend(live_lines)
                         retry_at = str(limit_state.get("retry_at") or "").strip()
                         if retry_at:
                             lines.append(f"<b>Last retry window:</b> <code>{escape_html(retry_at)}</code>")
@@ -1622,6 +1742,7 @@ class CodexTelegramBridge:
                 "<b>Codex limits</b>",
                 "<b>Status:</b> <code>limit reached</code>",
             ]
+            lines.extend(live_lines)
             retry_at = str(limit_state.get("retry_at") or "").strip()
             if retry_at:
                 lines.append(f"<b>Retry after:</b> <code>{escape_html(retry_at)}</code>")
@@ -1631,12 +1752,22 @@ class CodexTelegramBridge:
                 [
                     "",
                     escape_html(str(limit_state.get("message") or "")),
+                ]
+            )
+            return "\n".join(lines)
+
+        if live_windows:
+            lines = [
+                "<b>Codex limits</b>",
+                "<b>Status:</b> <code>live</code>",
+            ]
+            if last_success_at:
+                lines.append(f"<b>Last successful run:</b> <code>{escape_html(self.format_when_utc(last_success_at))}</code>")
+            lines.extend(live_lines)
+            lines.extend(
+                [
                     "",
-                    "<b>5h remaining:</b> <code>unavailable from OpenAI</code>",
-                    "<b>Weekly remaining:</b> <code>unavailable from OpenAI</code>",
-                    "",
-                    "OpenAI does not expose remaining local Codex quota percentages to this bot. We can only show the last reset time once Codex returns it.",
-                    "You can wait for the reset time or reconnect this chat with <code>/login</code>.",
+                    "These numbers come from the latest Codex token-count event stored in the local session history.",
                 ]
             )
             return "\n".join(lines)
@@ -1647,11 +1778,10 @@ class CodexTelegramBridge:
                     "<b>Codex limits</b>",
                     "<b>Status:</b> <code>ready</code>",
                     f"<b>Last successful run:</b> <code>{escape_html(self.format_when_utc(last_success_at))}</code>",
-                    "<b>5h remaining:</b> <code>unavailable from OpenAI</code>",
-                    "<b>Weekly remaining:</b> <code>unavailable from OpenAI</code>",
+                    "<b>5h limit:</b> <code>not available yet</code>",
+                    "<b>Weekly limit:</b> <code>not available yet</code>",
                     "",
-                    "OpenAI does not expose remaining local Codex quota percentages or reset counters to this bot.",
-                    "This command can only show the last successful run and any reset time returned after a real quota hit.",
+                    "This chat has run Codex before, but no rate-limit snapshot was found yet in the local session history.",
                 ]
             )
 
@@ -1659,11 +1789,10 @@ class CodexTelegramBridge:
             [
                 "<b>Codex limits</b>",
                 "<b>Status:</b> <code>unknown</code>",
-                "<b>5h remaining:</b> <code>unavailable from OpenAI</code>",
-                "<b>Weekly remaining:</b> <code>unavailable from OpenAI</code>",
+                "<b>5h limit:</b> <code>not available yet</code>",
+                "<b>Weekly limit:</b> <code>not available yet</code>",
                 "",
-                "OpenAI does not expose remaining local Codex quota percentages or reset counters to this bot.",
-                "Run a task first. If this chat hits a quota wall later, the latest reset time will show up here.",
+                "Run Codex at least once in this chat. The bot reads the latest live snapshot from Codex session rollouts.",
             ]
         )
 
