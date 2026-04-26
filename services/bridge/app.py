@@ -1713,50 +1713,41 @@ class CodexTelegramBridge:
             self.format_rate_limit_line("5h limit", live_windows.get(300)),
             self.format_rate_limit_line("Weekly limit", live_windows.get(10080)),
         ]
-        if live_observed_at:
-            live_lines.append(self.render_kv_block([("Snapshot seen", self.format_when_utc(live_observed_at))]))
+        summary_rows: list[tuple[str, str]] = []
 
         if isinstance(limit_state, dict) and str(limit_state.get("message") or "").strip():
             observed_at = str(limit_state.get("observed_at") or "").strip()
             if observed_at and last_success_at:
                 try:
                     if parse_iso_datetime(last_success_at) > parse_iso_datetime(observed_at):
-                        blocks = [
-                            self.render_kv_block(
-                                [
-                                    ("Status", "ready"),
-                                    ("Last quota issue", self.format_when_utc(observed_at)),
-                                    ("Recovered at", self.format_when_utc(last_success_at)),
-                                ]
-                            )
-                        ]
+                        summary_rows = [("Status", "ready")]
+                        if live_observed_at:
+                            summary_rows.append(("Updated", self.format_when_utc(live_observed_at)))
+                        blocks = [self.render_kv_block(summary_rows)]
                         blocks.extend(live_lines)
                         retry_at = str(limit_state.get("retry_at") or "").strip()
                         if retry_at:
-                            blocks.append(self.render_kv_block([("Last retry window", retry_at)]))
-                        blocks.append("The latest Codex run for this chat completed successfully after the last quota issue.")
+                            blocks.append(self.render_kv_block([("Retry window", retry_at)]))
                         return self.render_panel("Codex limits", "\n\n".join(blocks))
                 except Exception:
                     pass
 
-            blocks = [
-                self.render_kv_block([("Status", "limit reached")]),
-            ]
+            summary_rows = [("Status", "limit reached")]
+            if live_observed_at:
+                summary_rows.append(("Updated", self.format_when_utc(live_observed_at)))
+            blocks = [self.render_kv_block(summary_rows)]
             blocks.extend(live_lines)
             retry_at = str(limit_state.get("retry_at") or "").strip()
             if retry_at:
                 blocks.append(self.render_kv_block([("Retry after", retry_at)]))
-            if observed_at:
-                blocks.append(self.render_kv_block([("Last seen", self.format_when_utc(observed_at))]))
-            blocks.append(escape_html(str(limit_state.get("message") or "")))
             return self.render_panel("Codex limits", "\n\n".join(blocks))
 
         if live_windows:
-            blocks = [self.render_kv_block([("Status", "live")])]
-            if last_success_at:
-                blocks.append(self.render_kv_block([("Last successful run", self.format_when_utc(last_success_at))]))
+            summary_rows = [("Status", "live")]
+            if live_observed_at:
+                summary_rows.append(("Updated", self.format_when_utc(live_observed_at)))
+            blocks = [self.render_kv_block(summary_rows)]
             blocks.extend(live_lines)
-            blocks.append("These numbers come from the latest Codex token-count event stored in the local session history.")
             return self.render_panel("Codex limits", "\n\n".join(blocks))
 
         if last_success_at:
@@ -1767,12 +1758,11 @@ class CodexTelegramBridge:
                         self.render_kv_block(
                             [
                                 ("Status", "ready"),
-                                ("Last successful run", self.format_when_utc(last_success_at)),
+                                ("Updated", self.format_when_utc(last_success_at)),
                             ]
                         ),
                         self.render_meter_block("5h limit", None, "Not available yet"),
                         self.render_meter_block("Weekly limit", None, "Not available yet"),
-                        "This chat has run Codex before, but no rate-limit snapshot was found yet in the local session history.",
                     ]
                 ),
             )
@@ -1784,7 +1774,6 @@ class CodexTelegramBridge:
                     self.render_kv_block([("Status", "unknown")]),
                     self.render_meter_block("5h limit", None, "Not available yet"),
                     self.render_meter_block("Weekly limit", None, "Not available yet"),
-                    "Run Codex at least once in this chat. The bot reads the latest live snapshot from Codex session rollouts.",
                 ]
             ),
         )
