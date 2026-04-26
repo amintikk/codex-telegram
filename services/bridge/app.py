@@ -1632,6 +1632,10 @@ class CodexTelegramBridge:
                     "",
                     escape_html(str(limit_state.get("message") or "")),
                     "",
+                    "<b>5h remaining:</b> <code>unavailable from OpenAI</code>",
+                    "<b>Weekly remaining:</b> <code>unavailable from OpenAI</code>",
+                    "",
+                    "OpenAI does not expose remaining local Codex quota percentages to this bot. We can only show the last reset time once Codex returns it.",
                     "You can wait for the reset time or reconnect this chat with <code>/login</code>.",
                 ]
             )
@@ -1643,16 +1647,22 @@ class CodexTelegramBridge:
                     "<b>Codex limits</b>",
                     "<b>Status:</b> <code>ready</code>",
                     f"<b>Last successful run:</b> <code>{escape_html(self.format_when_utc(last_success_at))}</code>",
+                    "<b>5h remaining:</b> <code>unavailable from OpenAI</code>",
+                    "<b>Weekly remaining:</b> <code>unavailable from OpenAI</code>",
                     "",
-                    "No recent quota issue is stored for this chat.",
+                    "OpenAI does not expose remaining local Codex quota percentages or reset counters to this bot.",
+                    "This command can only show the last successful run and any reset time returned after a real quota hit.",
                 ]
             )
 
         return "\n".join(
             [
                 "<b>Codex limits</b>",
-                "<b>Status:</b> <code>no recent usage data</code>",
+                "<b>Status:</b> <code>unknown</code>",
+                "<b>5h remaining:</b> <code>unavailable from OpenAI</code>",
+                "<b>Weekly remaining:</b> <code>unavailable from OpenAI</code>",
                 "",
+                "OpenAI does not expose remaining local Codex quota percentages or reset counters to this bot.",
                 "Run a task first. If this chat hits a quota wall later, the latest reset time will show up here.",
             ]
         )
