@@ -21,13 +21,6 @@ import requests
 TELEGRAM_API_BASE = "https://api.telegram.org"
 MODEL_REASONING_CONFIG_KEY = "model_reasoning_effort"
 DEFAULT_REASONING_LEVEL = "medium"
-MODEL_CHOICES = [
-    ("default", "Auto"),
-    ("gpt-5.4", "gpt-5.4"),
-    ("gpt-5.4-mini", "gpt-5.4-mini"),
-    ("gpt-5.3-codex", "gpt-5.3-codex"),
-    ("gpt-5.2", "gpt-5.2"),
-]
 THINKING_CHOICES = [
     ("default", "Auto"),
     ("low", "Low"),
@@ -81,6 +74,7 @@ class CodexTelegramBridge:
         self.pending_logins: dict[str, dict[str, Any]] = {}
         self.chat_sessions: dict[str, dict[str, Any]] = {}
         self.last_update_check = 0.0
+        self.models_cache: dict[str, dict[str, Any]] = {}
         self.state_lock = threading.Lock()
         self.login_lock = threading.Lock()
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1155,7 +1149,12 @@ class CodexTelegramBridge:
             return
 
         if kind == "model":
-            self.set_chat_preference(chat_id, "model", None if value == "default" else value)
+            normalized_model = None if value == "default" else value
+            self.set_chat_preference(chat_id, "model", normalized_model)
+            selected_reasoning = self.get_selected_reasoning(chat_id)
+            supported_reasoning = self.get_supported_reasoning_levels(chat_id, normalized_model)
+            if selected_reasoning and selected_reasoning not in supported_reasoning:
+                self.set_chat_preference(chat_id, "reasoning_effort", None)
             self.edit_message(
                 chat_id,
                 message_id,
@@ -1309,11 +1308,16 @@ class CodexTelegramBridge:
         self.answer_callback_query(callback_query_id)
 
     def build_model_picker_text(self, chat_id: str) -> str:
+        selected_model = self.get_selected_model(chat_id)
+        available_models = self.get_available_models(chat_id)
+        supported_reasoning = self.get_supported_reasoning_levels(chat_id, selected_model)
         return "\n".join(
             [
                 "<b>Model settings</b>",
                 f"<b>Model:</b> <code>{escape_html(self.get_effective_model(chat_id))}</code>",
                 f"<b>Thinking:</b> <code>{escape_html(self.get_effective_reasoning(chat_id))}</code>",
+                f"<b>Available models:</b> <code>{len(available_models)}</code>",
+                f"<b>Supported thinking:</b> <code>{escape_html(', '.join(supported_reasoning) if supported_reasoning else 'auto')}</code>",
                 "",
                 "Choose a model and a thinking level below.",
             ]
@@ -1323,13 +1327,17 @@ class CodexTelegramBridge:
         selected_model = self.get_selected_model(chat_id) or "default"
         selected_reasoning = self.get_selected_reasoning(chat_id) or "default"
         keyboard: list[list[dict[str, str]]] = []
+        model_choices = [("default", "Auto")] + self.get_available_model_choices(chat_id)
 
-        for value, label in MODEL_CHOICES:
+        for value, label in model_choices:
             prefix = "• " if value == selected_model else ""
             keyboard.append(
                 [{"text": f"{prefix}{label}", "callback_data": f"model:model:{value}"}]
             )
 
+        supported_reasoning = self.get_supported_reasoning_levels(
+            chat_id, None if selected_model == "default" else selected_model
+        )
         keyboard.append(
             [
                 {
@@ -1337,6 +1345,7 @@ class CodexTelegramBridge:
                     "callback_data": f"model:thinking:{value}",
                 }
                 for value, label in THINKING_CHOICES
+                if value == "default" or value in supported_reasoning
             ]
         )
         keyboard.append([{"text": "Close", "callback_data": "model:close"}])
@@ -2023,6 +2032,56 @@ class CodexTelegramBridge:
         session = self.get_or_create_chat_session(chat_id)
         value = session.get("reasoning_effort")
         return str(value).strip() if value else None
+
+    def get_available_models(self, chat_id: str) -> list[dict[str, Any]]:
+        now = time.time()
+        cache_entry = self.models_cache.get(chat_id)
+        if cache_entry and now - float(cache_entry.get("updated_at") or 0.0) < 3600:
+            return list(cache_entry.get("models") or [])
+        try:
+            result = subprocess.run(
+                ["codex", "debug", "models"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=True,
+                env=self.build_codex_env(chat_id),
+            )
+            payload = json.loads(result.stdout)
+            models = [
+                model
+                for model in payload.get("models", [])
+                if isinstance(model, dict) and str(model.get("visibility") or "").strip() == "list"
+            ]
+            self.models_cache[chat_id] = {"models": models, "updated_at": now}
+            return models
+        except Exception:
+            return list((cache_entry or {}).get("models") or [])
+
+    def get_available_model_choices(self, chat_id: str) -> list[tuple[str, str]]:
+        choices: list[tuple[str, str]] = []
+        for model in self.get_available_models(chat_id):
+            slug = str(model.get("slug") or "").strip()
+            if not slug:
+                continue
+            label = str(model.get("display_name") or slug).strip()
+            choices.append((slug, label))
+        return choices
+
+    def get_supported_reasoning_levels(self, chat_id: str, model_slug: str | None) -> list[str]:
+        effective_slug = model_slug or CODEX_MODEL
+        if not effective_slug:
+            return [value for value, _ in THINKING_CHOICES if value != "default"]
+        for model in self.get_available_models(chat_id):
+            if str(model.get("slug") or "").strip() != effective_slug:
+                continue
+            levels = [
+                str(level.get("effort") or "").strip()
+                for level in (model.get("supported_reasoning_levels") or [])
+                if isinstance(level, dict) and str(level.get("effort") or "").strip()
+            ]
+            return levels or [value for value, _ in THINKING_CHOICES if value != "default"]
+        return [value for value, _ in THINKING_CHOICES if value != "default"]
 
     def get_effective_model(self, chat_id: str) -> str:
         return self.get_selected_model(chat_id) or CODEX_MODEL or "auto"
