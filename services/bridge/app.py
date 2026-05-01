@@ -56,6 +56,59 @@ CRON_TIMEZONE = os.environ.get("CRON_TIMEZONE", "UTC").strip() or "UTC"
 RUNS_DIR = Path(os.environ.get("RUNS_DIR", "/data/runs"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/state.json"))
 TELEGRAM_UPLOADS_DIR = Path(os.environ.get("TELEGRAM_UPLOADS_DIR", "/data/telegram-uploads"))
+TEXT_ATTACHMENT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".markdown",
+    ".rst",
+    ".log",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".env",
+    ".csv",
+    ".tsv",
+    ".xml",
+    ".html",
+    ".htm",
+    ".css",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".py",
+    ".sql",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".c",
+    ".h",
+    ".hpp",
+    ".cpp",
+    ".cc",
+    ".rs",
+    ".go",
+    ".java",
+    ".kt",
+    ".swift",
+    ".rb",
+    ".php",
+    ".scala",
+    ".lua",
+    ".pl",
+    ".ps1",
+    ".dockerfile",
+    ".gitignore",
+    ".gitattributes",
+    ".editorconfig",
+}
+IMAGE_ATTACHMENT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+INLINE_TEXT_ATTACHMENT_MAX_BYTES = 200_000
 
 
 class BotError(RuntimeError):
@@ -232,7 +285,78 @@ class CodexTelegramBridge:
         response.raise_for_status()
         destination.write_bytes(response.content)
 
-    def resolve_message_image(self, message: dict[str, Any]) -> tuple[Path | None, str | None]:
+    def build_safe_upload_name(self, original_name: str, fallback_suffix: str = "") -> str:
+        candidate = Path(original_name or "").name.strip()
+        if not candidate:
+            candidate = f"attachment{fallback_suffix}"
+        candidate = re.sub(r"[^A-Za-z0-9._-]+", "-", candidate).strip("-")
+        return candidate or f"attachment{fallback_suffix}"
+
+    def is_text_attachment(self, file_name: str, mime_type: str) -> bool:
+        suffix = Path(file_name).suffix.lower()
+        if mime_type.startswith("text/"):
+            return True
+        if mime_type in {
+            "application/json",
+            "application/xml",
+            "application/javascript",
+            "application/x-javascript",
+            "application/sql",
+            "application/x-sh",
+            "application/x-shellscript",
+            "application/x-python-code",
+        }:
+            return True
+        return suffix in TEXT_ATTACHMENT_EXTENSIONS or file_name.lower() in {
+            "dockerfile",
+            ".env",
+            ".gitignore",
+            ".gitattributes",
+            ".editorconfig",
+        }
+
+    def build_attachment_prompt(
+        self,
+        attachment_path: Path,
+        attachment_kind: str,
+        original_name: str,
+        caption: str,
+    ) -> str:
+        normalized_caption = caption.strip()
+        if normalized_caption.startswith("/run "):
+            normalized_caption = normalized_caption[5:].strip()
+        elif normalized_caption.startswith("/run"):
+            normalized_caption = ""
+
+        display_name = original_name or attachment_path.name
+        header = [
+            f"Attached file: {display_name}",
+            f"Saved at: {attachment_path}",
+        ]
+
+        if attachment_kind == "image":
+            prompt = normalized_caption or "Analyze the attached image."
+            return prompt
+
+        if attachment_kind == "text":
+            prompt = normalized_caption or f"Review the attached file {display_name}."
+            try:
+                raw_bytes = attachment_path.read_bytes()
+                if len(raw_bytes) <= INLINE_TEXT_ATTACHMENT_MAX_BYTES:
+                    content = raw_bytes.decode("utf-8")
+                    body = "\n".join(header)
+                    return (
+                        f"{prompt}\n\n{body}\n\n"
+                        f"File contents:\n```text\n{content}\n```"
+                    )
+            except Exception:
+                pass
+            return f"{prompt}\n\n" + "\n".join(header)
+
+        prompt = normalized_caption or f"Inspect the attached file {display_name} if supported."
+        return f"{prompt}\n\n" + "\n".join(header)
+
+    def resolve_message_attachment(self, message: dict[str, Any]) -> tuple[Path | None, str | None, str | None]:
         photo_sizes = message.get("photo")
         if isinstance(photo_sizes, list) and photo_sizes:
             best = max(
@@ -245,26 +369,35 @@ class CodexTelegramBridge:
                 if file_id:
                     file_path = self.get_telegram_file_path(file_id)
                     suffix = Path(file_path).suffix or ".jpg"
-                    destination = TELEGRAM_UPLOADS_DIR / f"{uuid.uuid4().hex}{suffix}"
+                    destination = TELEGRAM_UPLOADS_DIR / f"{uuid.uuid4().hex}-photo{suffix}"
                     self.download_telegram_file(file_path, destination)
-                    return destination, "photo"
+                    return destination, "image", destination.name
 
         document = message.get("document")
         if isinstance(document, dict):
             mime_type = str(document.get("mime_type") or "").lower()
             file_name = str(document.get("file_name") or "")
             suffix = Path(file_name).suffix.lower()
-            is_image = mime_type.startswith("image/") or suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
-            if is_image:
-                file_id = str(document.get("file_id") or "").strip()
-                if file_id:
-                    file_path = self.get_telegram_file_path(file_id)
-                    final_suffix = Path(file_path).suffix or suffix or ".img"
-                    destination = TELEGRAM_UPLOADS_DIR / f"{uuid.uuid4().hex}{final_suffix}"
-                    self.download_telegram_file(file_path, destination)
-                    return destination, "document"
+            file_id = str(document.get("file_id") or "").strip()
+            if not file_id:
+                return None, None, None
 
-        return None, None
+            file_path = self.get_telegram_file_path(file_id)
+            final_suffix = Path(file_path).suffix or suffix
+            safe_name = self.build_safe_upload_name(file_name, final_suffix or "")
+            destination = TELEGRAM_UPLOADS_DIR / f"{uuid.uuid4().hex}-{safe_name}"
+            self.download_telegram_file(file_path, destination)
+
+            is_image = mime_type.startswith("image/") or suffix in IMAGE_ATTACHMENT_EXTENSIONS
+            if is_image:
+                return destination, "image", file_name or destination.name
+
+            if self.is_text_attachment(file_name, mime_type):
+                return destination, "text", file_name or destination.name
+
+            return destination, "file", file_name or destination.name
+
+        return None, None, None
 
     def register_bot_commands(self) -> None:
         commands = [
@@ -453,11 +586,13 @@ class CodexTelegramBridge:
         message_id: int,
         *,
         image_paths: list[Path] | None = None,
+        attachment_paths: list[Path] | None = None,
     ) -> None:
         image_paths = image_paths or []
+        attachment_paths = attachment_paths or []
         with self.state_lock:
             if self.active_job is not None:
-                self.cleanup_image_paths(image_paths)
+                self.cleanup_attachment_paths(image_paths + attachment_paths)
                 self.send_markdown(
                     chat_id,
                     "<b>Busy</b>\nAnother task is still running.",
@@ -467,7 +602,7 @@ class CodexTelegramBridge:
                 return
 
             if self.has_pending_login(chat_id):
-                self.cleanup_image_paths(image_paths)
+                self.cleanup_attachment_paths(image_paths + attachment_paths)
                 self.send_markdown(
                     chat_id,
                     "<b>Login in progress</b>\nFinish the device login first or use <code>/login cancel</code>.",
@@ -478,7 +613,7 @@ class CodexTelegramBridge:
 
             logged_in, _ = self.get_login_status(chat_id)
             if not logged_in:
-                self.cleanup_image_paths(image_paths)
+                self.cleanup_attachment_paths(image_paths + attachment_paths)
                 self.send_markdown(
                     chat_id,
                     "<b>Login required</b>\nUse <code>/login</code> to connect Codex for this chat before running tasks.",
@@ -513,7 +648,16 @@ class CodexTelegramBridge:
                 self.active_job["progress_message_id"] = progress_message_id
         worker = threading.Thread(
             target=self._run_prompt_worker,
-            args=(chat_id, prompt, message_id, image_paths, progress_message_id, typing_stop, typing_thread),
+            args=(
+                chat_id,
+                prompt,
+                message_id,
+                image_paths,
+                attachment_paths,
+                progress_message_id,
+                typing_stop,
+                typing_thread,
+            ),
             daemon=True,
         )
         worker.start()
@@ -524,6 +668,7 @@ class CodexTelegramBridge:
         prompt: str,
         message_id: int,
         image_paths: list[Path],
+        attachment_paths: list[Path],
         progress_message_id: int | None,
         typing_stop: threading.Event,
         typing_thread: threading.Thread,
@@ -560,7 +705,7 @@ class CodexTelegramBridge:
             typing_thread.join(timeout=1)
             with self.state_lock:
                 self.active_job = None
-            self.cleanup_image_paths(image_paths)
+            self.cleanup_attachment_paths(image_paths + attachment_paths)
 
     def execute_codex(
         self,
@@ -2168,8 +2313,8 @@ class CodexTelegramBridge:
             lines.append(self.render_kv_block([("Retry after", retry_at)]))
         return self.render_panel("Codex error", "\n\n".join(lines))
 
-    def cleanup_image_paths(self, image_paths: list[Path]) -> None:
-        for image_path in image_paths:
+    def cleanup_attachment_paths(self, attachment_paths: list[Path]) -> None:
+        for image_path in attachment_paths:
             try:
                 image_path.unlink(missing_ok=True)
             except Exception:
@@ -2321,7 +2466,7 @@ class CodexTelegramBridge:
         text = (message.get("text") or "").strip()
         caption = (message.get("caption") or "").strip()
         message_id = int(message.get("message_id") or 0)
-        has_image_message = bool(message.get("photo")) or isinstance(message.get("document"), dict)
+        has_attachment_message = bool(message.get("photo")) or isinstance(message.get("document"), dict)
 
         if not chat_id:
             return
@@ -2335,32 +2480,35 @@ class CodexTelegramBridge:
             self.handle_command(chat_id, text, message_id)
             return
 
-        if not has_image_message:
+        if not has_attachment_message:
             return
 
-        image_path, image_kind = self.resolve_message_image(message)
-        if image_path is None:
+        attachment_path, attachment_kind, original_name = self.resolve_message_attachment(message)
+        if attachment_path is None or attachment_kind is None:
             self.send_markdown(
                 chat_id,
-                "<b>Unsupported file</b>\nSend a Telegram photo or an image document.",
+                "<b>Unsupported file</b>\nSend a Telegram photo or a supported document such as <code>.txt</code>, <code>.py</code>, <code>.sql</code>, <code>.json</code> or similar.",
                 reply_to_message_id=message_id,
                 already_formatted=True,
             )
             return
 
-        prompt = caption
-        if caption.startswith("/run "):
-            prompt = caption[5:].strip()
-        elif caption.startswith("/run"):
-            prompt = ""
+        prompt = self.build_attachment_prompt(
+            attachment_path,
+            attachment_kind,
+            original_name or attachment_path.name,
+            caption,
+        )
 
-        if not prompt:
-            prompt = "Analyze the attached image."
-
-        if image_kind == "document" and not caption:
-            prompt = "Analyze the attached image document."
-
-        self.run_prompt(chat_id, prompt, message_id, image_paths=[image_path])
+        image_paths = [attachment_path] if attachment_kind == "image" else []
+        attachment_paths = [] if attachment_kind == "image" else [attachment_path]
+        self.run_prompt(
+            chat_id,
+            prompt,
+            message_id,
+            image_paths=image_paths,
+            attachment_paths=attachment_paths,
+        )
 
     def cron_scheduler_loop(self) -> None:
         while True:
