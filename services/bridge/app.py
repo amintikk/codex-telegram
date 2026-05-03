@@ -127,6 +127,7 @@ class CodexTelegramBridge:
         self.base_url = f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}"
         self.offset = 0
         self.active_job: dict[str, Any] | None = None
+        self.pending_jobs: list[dict[str, Any]] = []
         self.pending_logins: dict[str, dict[str, Any]] = {}
         self.chat_sessions: dict[str, dict[str, Any]] = {}
         self.last_update_check = 0.0
@@ -490,8 +491,11 @@ class CodexTelegramBridge:
             ("Thinking", current_reasoning),
             ("Crons", str(cron_count)),
         ]
+        with self.state_lock:
+            queue_size = len(self.pending_jobs)
         if auth_text:
             rows.append(("Session", auth_text))
+        rows.append(("Queued", str(queue_size)))
         with self.state_lock:
             if self.active_job:
                 rows.append(("Running", self.active_job["label"]))
@@ -614,46 +618,103 @@ class CodexTelegramBridge:
     ) -> None:
         image_paths = image_paths or []
         attachment_paths = attachment_paths or []
+        if self.has_pending_login(chat_id):
+            self.cleanup_attachment_paths(image_paths + attachment_paths)
+            self.send_markdown(
+                chat_id,
+                "<b>Login in progress</b>\nFinish the device login first or use <code>/login cancel</code>.",
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return
+
+        logged_in, _ = self.get_login_status(chat_id)
+        if not logged_in:
+            self.cleanup_attachment_paths(image_paths + attachment_paths)
+            self.send_markdown(
+                chat_id,
+                "<b>Login required</b>\nUse <code>/login</code> to connect Codex for this chat before running tasks.",
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+            return
+
+        label_source = prompt.strip().splitlines()[0][:100] or ("image task" if image_paths else "task")
+        job = {
+            "kind": "prompt",
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "label": label_source,
+            "prompt": prompt,
+            "image_paths": image_paths,
+            "attachment_paths": attachment_paths,
+        }
+        queue_position = self.enqueue_or_start_job(job)
+        if queue_position is not None:
+            self.send_markdown(
+                chat_id,
+                self.render_panel(
+                    "Queued",
+                    self.render_kv_block(
+                        [
+                            ("Position", str(queue_position)),
+                            ("Task", label_source),
+                        ]
+                    ),
+                ),
+                reply_to_message_id=message_id,
+                already_formatted=True,
+            )
+
+    def enqueue_or_start_job(self, job: dict[str, Any]) -> int | None:
         with self.state_lock:
-            if self.active_job is not None:
-                self.cleanup_attachment_paths(image_paths + attachment_paths)
-                self.send_markdown(
-                    chat_id,
-                    "<b>Busy</b>\nAnother task is still running.",
-                    reply_to_message_id=message_id,
-                    already_formatted=True,
-                )
-                return
+            if self.active_job is None and not self.pending_jobs:
+                self._activate_job_locked(job)
+                should_start = True
+                queue_position = None
+            else:
+                self.pending_jobs.append(job)
+                should_start = False
+                queue_position = len(self.pending_jobs)
 
-            if self.has_pending_login(chat_id):
-                self.cleanup_attachment_paths(image_paths + attachment_paths)
-                self.send_markdown(
-                    chat_id,
-                    "<b>Login in progress</b>\nFinish the device login first or use <code>/login cancel</code>.",
-                    reply_to_message_id=message_id,
-                    already_formatted=True,
-                )
-                return
+        if should_start:
+            self.launch_job(job)
+        return queue_position
 
-            logged_in, _ = self.get_login_status(chat_id)
-            if not logged_in:
-                self.cleanup_attachment_paths(image_paths + attachment_paths)
-                self.send_markdown(
-                    chat_id,
-                    "<b>Login required</b>\nUse <code>/login</code> to connect Codex for this chat before running tasks.",
-                    reply_to_message_id=message_id,
-                    already_formatted=True,
-                )
-                return
+    def _activate_job_locked(self, job: dict[str, Any]) -> None:
+        self.active_job = {
+            "kind": str(job.get("kind") or "prompt"),
+            "chat_id": str(job.get("chat_id") or ""),
+            "message_id": int(job.get("message_id") or 0),
+            "label": str(job.get("label") or "task"),
+            "started_at": utc_now(),
+            "job": job,
+        }
 
-            label_source = prompt.strip().splitlines()[0][:100] or ("image task" if image_paths else "task")
-            label = label_source
-            self.active_job = {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "label": label,
-                "started_at": utc_now(),
-            }
+    def start_next_queued_job(self) -> None:
+        with self.state_lock:
+            if self.active_job is not None or not self.pending_jobs:
+                return
+            job = self.pending_jobs.pop(0)
+            self._activate_job_locked(job)
+        self.launch_job(job)
+
+    def launch_job(self, job: dict[str, Any]) -> None:
+        kind = str(job.get("kind") or "prompt")
+        if kind == "cron":
+            thread = threading.Thread(
+                target=self.run_cron_job,
+                args=(str(job.get("chat_id") or ""), dict(job.get("cron_job") or {})),
+                daemon=True,
+            )
+            thread.start()
+            return
+
+        chat_id = str(job.get("chat_id") or "")
+        prompt = str(job.get("prompt") or "")
+        message_id = int(job.get("message_id") or 0)
+        image_paths = list(job.get("image_paths") or [])
+        attachment_paths = list(job.get("attachment_paths") or [])
 
         typing_stop = threading.Event()
         typing_thread = threading.Thread(
@@ -665,7 +726,7 @@ class CodexTelegramBridge:
         progress_message_id = self.send_panel(
             chat_id,
             self.build_progress_text([], "Working"),
-            reply_to_message_id=message_id,
+            reply_to_message_id=message_id or None,
         )
         with self.state_lock:
             if self.active_job is not None:
@@ -730,6 +791,7 @@ class CodexTelegramBridge:
             with self.state_lock:
                 self.active_job = None
             self.cleanup_attachment_paths(image_paths + attachment_paths)
+            self.start_next_queued_job()
 
     def execute_codex(
         self,
@@ -2541,10 +2603,6 @@ class CodexTelegramBridge:
             time.sleep(max(5, CRON_POLL_SECONDS))
 
     def check_due_crons(self) -> None:
-        with self.state_lock:
-            if self.active_job is not None:
-                return
-
         now = utc_now_dt()
         for chat_id in list(self.chat_sessions.keys()):
             for job in self.get_chat_cron_jobs(chat_id):
@@ -2560,22 +2618,24 @@ class CodexTelegramBridge:
                         return
 
     def try_start_cron_job(self, chat_id: str, job: dict[str, Any]) -> bool:
-        with self.state_lock:
-            if self.active_job is not None:
-                return False
-            self.active_job = {
-                "chat_id": chat_id,
-                "message_id": 0,
-                "label": f"cron:{str(job.get('name') or job.get('id') or 'job')[:100]}",
-                "started_at": utc_now(),
-            }
+        jobs = self.get_chat_cron_jobs(chat_id)
+        schedule = str(job.get("schedule") or "")
+        job_id = str(job.get("id") or "")
+        for existing in jobs:
+            if existing.get("id") == job_id:
+                existing["last_run_at"] = utc_now()
+                existing["next_run_at"] = self.compute_next_run_iso(schedule)
+                break
+        self.set_chat_cron_jobs(chat_id, jobs)
 
-        thread = threading.Thread(
-            target=self.run_cron_job,
-            args=(chat_id, dict(job)),
-            daemon=True,
-        )
-        thread.start()
+        queued_job = {
+            "kind": "cron",
+            "chat_id": chat_id,
+            "message_id": 0,
+            "label": f"cron:{str(job.get('name') or job.get('id') or 'job')[:100]}",
+            "cron_job": dict(job),
+        }
+        self.enqueue_or_start_job(queued_job)
         return True
 
     def run_cron_job(self, chat_id: str, job: dict[str, Any]) -> None:
@@ -2583,14 +2643,6 @@ class CodexTelegramBridge:
         schedule = str(job.get("schedule") or "")
         progress_message_id = None
         try:
-            jobs = self.get_chat_cron_jobs(chat_id)
-            for existing in jobs:
-                if existing.get("id") == job_id:
-                    existing["last_run_at"] = utc_now()
-                    existing["next_run_at"] = self.compute_next_run_iso(schedule)
-                    break
-            self.set_chat_cron_jobs(chat_id, jobs)
-
             progress_message_id = self.send_panel(
                 chat_id,
                 self.build_progress_text(
@@ -2629,6 +2681,7 @@ class CodexTelegramBridge:
         finally:
             with self.state_lock:
                 self.active_job = None
+            self.start_next_queued_job()
 
     def run_forever(self) -> None:
         self.ensure_codex_current()
