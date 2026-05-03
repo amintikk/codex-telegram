@@ -56,6 +56,9 @@ CRON_TIMEZONE = os.environ.get("CRON_TIMEZONE", "UTC").strip() or "UTC"
 RUNS_DIR = Path(os.environ.get("RUNS_DIR", "/data/runs"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/state.json"))
 TELEGRAM_UPLOADS_DIR = Path(os.environ.get("TELEGRAM_UPLOADS_DIR", "/data/telegram-uploads"))
+TELEGRAM_UPLOAD_TTL_SECONDS = int(
+    os.environ.get("TELEGRAM_UPLOAD_TTL_SECONDS", str(24 * 60 * 60)).strip() or str(24 * 60 * 60)
+)
 TEXT_ATTACHMENT_EXTENSIONS = {
     ".txt",
     ".md",
@@ -127,6 +130,7 @@ class CodexTelegramBridge:
         self.pending_logins: dict[str, dict[str, Any]] = {}
         self.chat_sessions: dict[str, dict[str, Any]] = {}
         self.last_update_check = 0.0
+        self.last_upload_cleanup = 0.0
         self.models_cache: dict[str, dict[str, Any]] = {}
         self.state_lock = threading.Lock()
         self.login_lock = threading.Lock()
@@ -135,6 +139,7 @@ class CodexTelegramBridge:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         CODEX_AUTH_ROOT.mkdir(parents=True, exist_ok=True)
         self._load_state()
+        self.cleanup_expired_uploads(force=True)
         self.register_bot_commands()
 
     def _load_state(self) -> None:
@@ -260,6 +265,7 @@ class CodexTelegramBridge:
         return int(message_id) if message_id else None
 
     def get_updates(self) -> list[dict[str, Any]]:
+        self.cleanup_expired_uploads()
         response = self._telegram(
             "getUpdates",
             data={
@@ -284,6 +290,24 @@ class CodexTelegramBridge:
         response = self.session.get(file_url, timeout=120)
         response.raise_for_status()
         destination.write_bytes(response.content)
+
+    def cleanup_expired_uploads(self, *, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self.last_upload_cleanup < 3600:
+            return
+        self.last_upload_cleanup = now
+        cutoff = now - TELEGRAM_UPLOAD_TTL_SECONDS
+        try:
+            for path in TELEGRAM_UPLOADS_DIR.iterdir():
+                try:
+                    if not path.is_file():
+                        continue
+                    if path.stat().st_mtime < cutoff:
+                        path.unlink(missing_ok=True)
+                except Exception:
+                    continue
+        except Exception:
+            return
 
     def build_safe_upload_name(self, original_name: str, fallback_suffix: str = "") -> str:
         candidate = Path(original_name or "").name.strip()
@@ -336,7 +360,7 @@ class CodexTelegramBridge:
 
         if attachment_kind == "image":
             prompt = normalized_caption or "Analyze the attached image."
-            return prompt
+            return f"{prompt}\n\n" + "\n".join(header)
 
         if attachment_kind == "text":
             prompt = normalized_caption or f"Review the attached file {display_name}."
@@ -487,7 +511,7 @@ class CodexTelegramBridge:
                     [
                         "<b>Codex Telegram Bridge</b>",
                         "Send any message and it will be forwarded to Codex CLI.",
-                        "You can also send a photo or image document, with or without a caption.",
+                        "You can also send photos or documents such as text, code, SQL, JSON, and similar files.",
                         "",
                         "<b>Commands</b>",
                         "<code>/login</code> connect Codex for this chat",
@@ -2314,11 +2338,9 @@ class CodexTelegramBridge:
         return self.render_panel("Codex error", "\n\n".join(lines))
 
     def cleanup_attachment_paths(self, attachment_paths: list[Path]) -> None:
-        for image_path in attachment_paths:
-            try:
-                image_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        # Telegram uploads stay available for a while so Codex can reuse or copy them.
+        # A background TTL cleanup removes files older than the configured retention window.
+        self.cleanup_expired_uploads()
 
     def create_progress_state(self, chat_id: str, message_id: int | None) -> dict[str, Any]:
         return {
