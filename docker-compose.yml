@@ -23,6 +23,7 @@ services:
       AUTO_UPDATE_MIN_INTERVAL_SECONDS: ${AUTO_UPDATE_MIN_INTERVAL_SECONDS:-21600}
       TELEGRAM_PARSE_MODE: ${TELEGRAM_PARSE_MODE:-HTML}
       TELEGRAM_POLL_SECONDS: ${TELEGRAM_POLL_SECONDS:-30}
+      BRIDGE_REPO_DIR: ${BRIDGE_REPO_DIR:-/home/ubuntu/docker/codex-telegram}
       RUNS_DIR: /data/runs
       STATE_FILE: /data/state.json
     working_dir: /home/ubuntu

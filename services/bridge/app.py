@@ -53,6 +53,10 @@ TELEGRAM_PARSE_MODE = os.environ.get("TELEGRAM_PARSE_MODE", "MarkdownV2").strip(
 TELEGRAM_POLL_SECONDS = int(os.environ.get("TELEGRAM_POLL_SECONDS", "30").strip() or "30")
 CRON_POLL_SECONDS = int(os.environ.get("CRON_POLL_SECONDS", "15").strip() or "15")
 CRON_TIMEZONE = os.environ.get("CRON_TIMEZONE", "UTC").strip() or "UTC"
+BRIDGE_REPO_DIR = Path(
+    os.environ.get("BRIDGE_REPO_DIR", "/home/ubuntu/docker/codex-telegram").strip()
+    or "/home/ubuntu/docker/codex-telegram"
+)
 RUNS_DIR = Path(os.environ.get("RUNS_DIR", "/data/runs"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/state.json"))
 TELEGRAM_UPLOADS_DIR = Path(os.environ.get("TELEGRAM_UPLOADS_DIR", "/data/telegram-uploads"))
@@ -558,11 +562,23 @@ class CodexTelegramBridge:
 
         if command == "/update":
             version = self.force_codex_update()
+            repo_status = self.get_repo_update_status()
+            rows = [("Version", version), ("Channel", CODEX_CHANNEL)]
+            if repo_status.get("available") is True:
+                rows.append(("Bridge repo", "update available"))
+                rows.append(("Local", str(repo_status.get("local_sha") or "unknown")))
+                rows.append(("Remote", str(repo_status.get("remote_sha") or "unknown")))
+                rows.append(("Commits behind", str(repo_status.get("behind_count") or 0)))
+            elif repo_status.get("available") is False:
+                rows.append(("Bridge repo", "up to date"))
+                rows.append(("Commit", str(repo_status.get("local_sha") or "unknown")))
+            else:
+                rows.append(("Bridge repo", "check failed"))
             self.send_markdown(
                 chat_id,
                 self.render_panel(
                     "Codex updated",
-                    self.render_kv_block([("Version", version), ("Channel", CODEX_CHANNEL)]),
+                    self.render_kv_block(rows),
                 ),
                 reply_to_message_id=message_id,
                 already_formatted=True,
@@ -1834,6 +1850,41 @@ class CodexTelegramBridge:
         )
         self.last_update_check = time.time()
         return get_current_codex_version()
+
+    def get_repo_update_status(self) -> dict[str, Any]:
+        try:
+            repo_root = BRIDGE_REPO_DIR
+            def run_host_git(*git_args: str) -> str:
+                quoted_args = " ".join(shlex.quote(arg) for arg in git_args)
+                command = (
+                    f"git -c safe.directory={shlex.quote(str(repo_root))} "
+                    f"-C {shlex.quote(str(repo_root))} {quoted_args}"
+                )
+                result = subprocess.run(
+                    ["bash", "-lc", command],
+                    cwd=str(repo_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=True,
+                )
+                return result.stdout.strip()
+
+            branch = run_host_git("branch", "--show-current") or "main"
+            run_host_git("fetch", "origin", "--quiet")
+            local_sha = run_host_git("rev-parse", "--short", "HEAD")
+            remote_ref = f"origin/{branch}"
+            remote_sha = run_host_git("rev-parse", "--short", remote_ref)
+            behind_count = int(run_host_git("rev-list", "--count", f"HEAD..{remote_ref}") or "0")
+            return {
+                "available": behind_count > 0,
+                "branch": branch,
+                "local_sha": local_sha or "unknown",
+                "remote_sha": remote_sha or "unknown",
+                "behind_count": behind_count,
+            }
+        except Exception as exc:
+            return {"available": None, "error": str(exc)}
 
     def get_latest_rate_limit_snapshot(self, chat_id: str) -> dict[str, Any] | None:
         sessions_dir = self.get_codex_home(chat_id) / "sessions"
