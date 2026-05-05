@@ -125,9 +125,9 @@ STT_MODEL_NAME = os.environ.get("STT_MODEL", "base").strip() or "base"
 STT_LANGUAGE = os.environ.get("STT_LANGUAGE", "").strip()
 STT_COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "int8").strip() or "int8"
 STT_MODEL_DIR = Path(os.environ.get("STT_MODEL_DIR", "/data/stt-models"))
-TTS_VOICE = os.environ.get("TTS_VOICE", "es").strip() or "es"
-TTS_SPEED = int(os.environ.get("TTS_SPEED", "165").strip() or "165")
-TTS_PITCH = int(os.environ.get("TTS_PITCH", "45").strip() or "45")
+TTS_VOICE = os.environ.get("TTS_VOICE", "es+f3").strip() or "es+f3"
+TTS_SPEED = int(os.environ.get("TTS_SPEED", "150").strip() or "150")
+TTS_PITCH = int(os.environ.get("TTS_PITCH", "32").strip() or "32")
 TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "5000").strip() or "5000")
 PHOTO_OUTPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 OUTPUT_FILE_LINE_RE = re.compile(r"^\s*OUTPUT_FILE:\s*(?P<path>.+?)\s*$", re.MULTILINE)
@@ -506,14 +506,18 @@ class CodexTelegramBridge:
                 "-y",
                 "-i",
                 str(wav_path),
+                "-af",
+                "loudnorm=I=-16:LRA=11:TP=-1.5",
                 "-ac",
                 "1",
                 "-ar",
-                "48000",
+                "24000",
                 "-c:a",
                 "libopus",
                 "-b:a",
-                "32k",
+                "48k",
+                "-vbr",
+                "on",
                 "-application",
                 "voip",
                 str(voice_path),
