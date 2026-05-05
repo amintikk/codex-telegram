@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 import uuid
+import wave
 from datetime import UTC
 from datetime import datetime
 from html import escape as escape_html
@@ -16,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from croniter import croniter
 from faster_whisper import WhisperModel
+from piper.voice import PiperVoice
 import requests
 
 
@@ -129,6 +131,9 @@ TTS_VOICE = os.environ.get("TTS_VOICE", "es+f3").strip() or "es+f3"
 TTS_SPEED = int(os.environ.get("TTS_SPEED", "150").strip() or "150")
 TTS_PITCH = int(os.environ.get("TTS_PITCH", "32").strip() or "32")
 TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "5000").strip() or "5000")
+TTS_ENGINE = os.environ.get("TTS_ENGINE", "piper").strip().lower() or "piper"
+TTS_PIPER_VOICE = os.environ.get("TTS_PIPER_VOICE", "es_ES-sharvard-medium").strip() or "es_ES-sharvard-medium"
+TTS_PIPER_DIR = Path(os.environ.get("TTS_PIPER_DIR", "/data/piper-voices"))
 PHOTO_OUTPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 OUTPUT_FILE_LINE_RE = re.compile(r"^\s*OUTPUT_FILE:\s*(?P<path>.+?)\s*$", re.MULTILINE)
 AUDIO_INPUT_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".oga", ".opus", ".aac", ".flac", ".mp4", ".mpeg"}
@@ -154,14 +159,17 @@ class CodexTelegramBridge:
         self.last_upload_cleanup = 0.0
         self.models_cache: dict[str, dict[str, Any]] = {}
         self.stt_model: WhisperModel | None = None
+        self.piper_voice: PiperVoice | None = None
         self.state_lock = threading.Lock()
         self.login_lock = threading.Lock()
         self.stt_lock = threading.Lock()
+        self.piper_lock = threading.Lock()
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         TELEGRAM_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         CODEX_AUTH_ROOT.mkdir(parents=True, exist_ok=True)
         STT_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        TTS_PIPER_DIR.mkdir(parents=True, exist_ok=True)
         self._load_state()
         self.cleanup_expired_uploads(force=True)
         self.register_bot_commands()
@@ -475,13 +483,46 @@ class CodexTelegramBridge:
             return f"{normalized_caption}\n\nVoice transcript:\n{transcript}"
         return transcript
 
-    def synthesize_speech(self, text: str) -> Path:
-        plain_text = collapse_whitespace(html_to_plain_text(text))
-        if not plain_text:
-            raise BotError("There is no text available for audio playback.")
-        limited_text = plain_text[:TTS_MAX_CHARS].strip()
-        wav_path = RUNS_DIR / f"tts-{uuid.uuid4().hex}.wav"
-        voice_path = wav_path.with_suffix(".ogg")
+    def ensure_piper_voice_files(self) -> tuple[Path, Path]:
+        model_path = TTS_PIPER_DIR / f"{TTS_PIPER_VOICE}.onnx"
+        config_path = TTS_PIPER_DIR / f"{TTS_PIPER_VOICE}.onnx.json"
+        if model_path.exists() and config_path.exists():
+            return model_path, config_path
+        subprocess.run(
+            [
+                "python",
+                "-m",
+                "piper.download_voices",
+                "--download-dir",
+                str(TTS_PIPER_DIR),
+                TTS_PIPER_VOICE,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if not model_path.exists() or not config_path.exists():
+            raise BotError(f"Unable to download Piper voice {TTS_PIPER_VOICE}.")
+        return model_path, config_path
+
+    def get_piper_voice(self) -> PiperVoice:
+        with self.piper_lock:
+            if self.piper_voice is None:
+                model_path, config_path = self.ensure_piper_voice_files()
+                self.piper_voice = PiperVoice.load(
+                    model_path=model_path,
+                    config_path=config_path,
+                    use_cuda=False,
+                )
+            return self.piper_voice
+
+    def synthesize_speech_with_piper(self, text: str, wav_path: Path) -> None:
+        voice = self.get_piper_voice()
+        with wave.open(str(wav_path), "wb") as wav_file:
+            voice.synthesize_wav(text, wav_file)
+
+    def synthesize_speech_with_espeak(self, text: str, wav_path: Path) -> None:
         subprocess.run(
             [
                 "espeak-ng",
@@ -493,13 +534,34 @@ class CodexTelegramBridge:
                 str(TTS_PITCH),
                 "-w",
                 str(wav_path),
-                limited_text,
+                text,
             ],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
+
+    def synthesize_speech(self, text: str) -> Path:
+        plain_text = collapse_whitespace(html_to_plain_text(text))
+        if not plain_text:
+            raise BotError("There is no text available for audio playback.")
+        limited_text = plain_text[:TTS_MAX_CHARS].strip()
+        wav_path = RUNS_DIR / f"tts-{uuid.uuid4().hex}.wav"
+        voice_path = wav_path.with_suffix(".ogg")
+        synth_error: Exception | None = None
+        if TTS_ENGINE == "piper":
+            try:
+                self.synthesize_speech_with_piper(limited_text, wav_path)
+            except Exception as exc:
+                synth_error = exc
+        if not wav_path.exists():
+            try:
+                self.synthesize_speech_with_espeak(limited_text, wav_path)
+            except Exception as exc:
+                if synth_error is not None:
+                    raise BotError(f"Piper TTS failed ({synth_error}) and espeak fallback also failed ({exc}).")
+                raise
         subprocess.run(
             [
                 "ffmpeg",

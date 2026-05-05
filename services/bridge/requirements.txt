@@ -1,3 +1,4 @@
 requests==2.32.3
 croniter==2.0.5
 faster-whisper==1.1.1
+piper-tts==1.4.2
