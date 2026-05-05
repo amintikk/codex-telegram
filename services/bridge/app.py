@@ -122,7 +122,6 @@ TELEGRAM_SEND_FILE_MAX_BYTES = int(
 )
 PHOTO_OUTPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 OUTPUT_FILE_LINE_RE = re.compile(r"^\s*OUTPUT_FILE:\s*(?P<path>.+?)\s*$", re.MULTILINE)
-FALLBACK_OUTPUT_PATH_RE = re.compile(r"(?P<path>/[A-Za-z0-9._~@%+:/=-]+?\.[A-Za-z0-9][A-Za-z0-9._-]*)")
 
 
 class BotError(RuntimeError):
@@ -2942,10 +2941,11 @@ def resolve_target_codex_version(channel: str) -> str:
 
 def append_output_delivery_instruction(prompt: str) -> str:
     instruction = (
-        "If you create, export, or update any file that should be delivered back to the Telegram user, "
+        "Only if the user explicitly asks you to send, return, export, attach, or deliver a file back through Telegram, "
+        "and only after that file already exists, "
         "end your final response with one line per file using exactly this format:\n"
         "OUTPUT_FILE: /absolute/path/to/file\n"
-        "Only include real files that already exist and that the user should receive."
+        "Do not include OUTPUT_FILE lines for normal code edits, repo changes, intermediate files, or anything the user did not ask to receive."
     )
     return f"{str(prompt).rstrip()}\n\n{instruction}"
 
@@ -2956,16 +2956,6 @@ def extract_output_file_candidates(*texts: str) -> list[str]:
         if not text:
             continue
         candidates.extend(match.group("path").strip() for match in OUTPUT_FILE_LINE_RE.finditer(text))
-    if candidates:
-        return candidates
-
-    for text in texts:
-        if not text:
-            continue
-        for match in FALLBACK_OUTPUT_PATH_RE.finditer(text):
-            path = match.group("path").strip().rstrip(").,;:!?")
-            if path:
-                candidates.append(path)
     return candidates
 
 
