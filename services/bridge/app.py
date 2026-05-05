@@ -116,6 +116,13 @@ TEXT_ATTACHMENT_EXTENSIONS = {
 }
 IMAGE_ATTACHMENT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 INLINE_TEXT_ATTACHMENT_MAX_BYTES = 200_000
+TELEGRAM_SEND_FILE_MAX_BYTES = int(
+    os.environ.get("TELEGRAM_SEND_FILE_MAX_BYTES", str(49 * 1024 * 1024)).strip()
+    or str(49 * 1024 * 1024)
+)
+PHOTO_OUTPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+OUTPUT_FILE_LINE_RE = re.compile(r"^\s*OUTPUT_FILE:\s*(?P<path>.+?)\s*$", re.MULTILINE)
+FALLBACK_OUTPUT_PATH_RE = re.compile(r"(?P<path>/[A-Za-z0-9._~@%+:/=-]+?\.[A-Za-z0-9][A-Za-z0-9._-]*)")
 
 
 class BotError(RuntimeError):
@@ -245,6 +252,114 @@ class CodexTelegramBridge:
                 if index == 0 and reply_to_message_id:
                     fallback_data["reply_to_message_id"] = reply_to_message_id
                 self._telegram("sendMessage", data=fallback_data)
+
+    def send_file_attachment(
+        self,
+        chat_id: str,
+        file_path: Path,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        suffix = file_path.suffix.lower()
+        methods = ["sendPhoto", "sendDocument"] if suffix in PHOTO_OUTPUT_EXTENSIONS else ["sendDocument"]
+        mime_type = guess_telegram_mime_type(file_path)
+        last_error = ""
+        for method in methods:
+            field_name = "photo" if method == "sendPhoto" else "document"
+            data: dict[str, Any] = {"chat_id": chat_id}
+            if reply_to_message_id:
+                data["reply_to_message_id"] = reply_to_message_id
+            with file_path.open("rb") as handle:
+                files = {
+                    field_name: (
+                        file_path.name,
+                        handle,
+                        mime_type,
+                    )
+                }
+                response = self.session.post(
+                    f"{self.base_url}/{method}",
+                    data=data,
+                    files=files,
+                    timeout=300,
+                )
+            try:
+                response.raise_for_status()
+                payload = response.json()
+                if payload.get("ok"):
+                    return
+                last_error = payload.get("description") or f"Telegram API error calling {method}"
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+        raise BotError(last_error or "Telegram rejected the file upload.")
+
+    def send_output_attachments(
+        self,
+        chat_id: str,
+        file_paths: list[Path],
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        if not file_paths:
+            return
+
+        sent_names: list[str] = []
+        skipped: list[str] = []
+        replied = False
+        for file_path in file_paths:
+            if not file_path.exists() or not file_path.is_file():
+                skipped.append(f"{file_path.name}: missing")
+                continue
+            try:
+                size = file_path.stat().st_size
+            except Exception:
+                skipped.append(f"{file_path.name}: unreadable")
+                continue
+            if size <= 0:
+                skipped.append(f"{file_path.name}: empty")
+                continue
+            if size > TELEGRAM_SEND_FILE_MAX_BYTES:
+                skipped.append(
+                    f"{file_path.name}: too large ({format_bytes(size)}, limit {format_bytes(TELEGRAM_SEND_FILE_MAX_BYTES)})"
+                )
+                continue
+
+            self.send_chat_action(chat_id, "upload_document")
+            try:
+                self.send_file_attachment(
+                    chat_id,
+                    file_path,
+                    reply_to_message_id=reply_to_message_id if not replied else None,
+                )
+                replied = True
+                sent_names.append(file_path.name)
+            except Exception as exc:
+                skipped.append(f"{file_path.name}: {str(exc)}")
+
+        if not sent_names and not skipped:
+            return
+
+        rows = []
+        if sent_names:
+            rows.append(("Sent", str(len(sent_names))))
+        if skipped:
+            rows.append(("Skipped", str(len(skipped))))
+        blocks = [self.render_kv_block(rows)] if rows else []
+        if sent_names:
+            blocks.append(
+                "<pre>" + escape_html("Delivered\n" + "\n".join(f"- {name}" for name in sent_names[:8])) + "</pre>"
+            )
+        if skipped:
+            blocks.append(
+                "<pre>" + escape_html("Skipped\n" + "\n".join(f"- {item}" for item in skipped[:8])) + "</pre>"
+            )
+        self.send_markdown(
+            chat_id,
+            self.render_panel("Files", "\n\n".join(blocks)),
+            reply_to_message_id=reply_to_message_id if not replied else None,
+            already_formatted=True,
+        )
 
     def send_panel(
         self,
@@ -776,7 +891,7 @@ class CodexTelegramBridge:
     ) -> None:
         try:
             self.ensure_codex_current()
-            result, already_formatted = self.execute_codex(
+            result, already_formatted, output_files = self.execute_codex(
                 prompt,
                 chat_id,
                 image_paths=image_paths,
@@ -787,6 +902,11 @@ class CodexTelegramBridge:
                 result,
                 reply_to_message_id=message_id,
                 already_formatted=already_formatted,
+            )
+            self.send_output_attachments(
+                chat_id,
+                output_files,
+                reply_to_message_id=message_id or None,
             )
         except Exception as exc:
             self.send_markdown(
@@ -816,12 +936,13 @@ class CodexTelegramBridge:
         *,
         image_paths: list[Path] | None = None,
         progress_message_id: int | None = None,
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, bool, list[Path]]:
         image_paths = image_paths or []
         run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         last_message_file = RUNS_DIR / f"{run_id}-last-message.txt"
         events_file = RUNS_DIR / f"{run_id}-events.jsonl"
         output_file = RUNS_DIR / f"{run_id}-stdout.log"
+        delivered_prompt = append_output_delivery_instruction(prompt)
 
         session = self.get_or_create_chat_session(chat_id)
         thread_id = str(session.get("thread_id") or "").strip()
@@ -843,7 +964,7 @@ class CodexTelegramBridge:
             for image_path in image_paths:
                 command.extend(["-i", str(image_path)])
             command.extend(CODEX_EXTRA_ARGS)
-            command.extend([thread_id, prompt])
+            command.extend([thread_id, delivered_prompt])
         else:
             command = [
                 "codex",
@@ -863,7 +984,7 @@ class CodexTelegramBridge:
                 command.extend(["-i", str(image_path)])
 
             command.extend(CODEX_EXTRA_ARGS)
-            command.append(prompt)
+            command.append(delivered_prompt)
 
         process = subprocess.Popen(
             command,
@@ -910,7 +1031,7 @@ class CodexTelegramBridge:
             }
             self.set_chat_limit_state(chat_id, limit_state)
             self.finish_progress_state(progress_state, "Usage limit")
-            return self.format_limit_reached_message(limit_state), True
+            return self.format_limit_reached_message(limit_state), True, []
 
         final_message = ""
         if last_message_file.exists():
@@ -924,26 +1045,33 @@ class CodexTelegramBridge:
 
         if stopped:
             self.finish_progress_state(progress_state, "Stopped")
-            return "<b>Stopped</b>\nThe running Codex task was cancelled.", True
+            return "<b>Stopped</b>\nThe running Codex task was cancelled.", True, []
 
         if not final_message:
             if error_info:
                 self.finish_progress_state(progress_state, "Failed")
-                return self.format_codex_error_message(error_info), True
+                return self.format_codex_error_message(error_info), True, []
             final_message = "Codex finished without a final message."
+
+        output_files = self.collect_output_files(final_message, stdout_text)
+        stripped_final_message = strip_output_file_lines(final_message).strip()
+        if stripped_final_message:
+            final_message = stripped_final_message
+        elif output_files:
+            final_message = "Completed."
 
         body = final_message
         if return_code != 0:
             if error_info:
                 self.finish_progress_state(progress_state, "Failed")
-                return self.format_codex_error_message(error_info), True
+                return self.format_codex_error_message(error_info), True, output_files
             tail = tail_text(stdout_text, 1200)
             body += "\n\nCommand output tail:\n" + tail
             self.finish_progress_state(progress_state, "Failed")
-            return body, False
+            return body, False, output_files
 
         self.finish_progress_state(progress_state, "Completed")
-        return body, False
+        return body, False, output_files
 
     def has_pending_login(self, chat_id: str) -> bool:
         with self.login_lock:
@@ -2450,6 +2578,21 @@ class CodexTelegramBridge:
             lines.append(self.render_kv_block([("Retry after", retry_at)]))
         return self.render_panel("Codex error", "\n\n".join(lines))
 
+    def collect_output_files(self, final_message: str, stdout_text: str) -> list[Path]:
+        candidates = extract_output_file_candidates(final_message, stdout_text)
+        resolved: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            path = resolve_output_file_path(candidate)
+            if path is None:
+                continue
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(path)
+        return resolved[:8]
+
     def cleanup_attachment_paths(self, attachment_paths: list[Path]) -> None:
         # Telegram uploads stay available for a while so Codex can reuse or copy them.
         # A background TTL cleanup removes files older than the configured retention window.
@@ -2708,12 +2851,13 @@ class CodexTelegramBridge:
                 if self.active_job is not None:
                     self.active_job["progress_message_id"] = progress_message_id
 
-            result, already_formatted = self.execute_codex(
+            result, already_formatted, output_files = self.execute_codex(
                 str(job.get("prompt") or ""),
                 chat_id,
                 progress_message_id=progress_message_id,
             )
             self.send_markdown(chat_id, result, already_formatted=already_formatted)
+            self.send_output_attachments(chat_id, output_files)
         except Exception as exc:
             self.send_markdown(
                 chat_id,
@@ -2803,6 +2947,56 @@ def resolve_target_codex_version(channel: str) -> str:
     if not target:
         raise BotError(f"Unknown Codex channel: {requested}")
     return target
+
+
+def append_output_delivery_instruction(prompt: str) -> str:
+    instruction = (
+        "If you create, export, or update any file that should be delivered back to the Telegram user, "
+        "end your final response with one line per file using exactly this format:\n"
+        "OUTPUT_FILE: /absolute/path/to/file\n"
+        "Only include real files that already exist and that the user should receive."
+    )
+    return f"{str(prompt).rstrip()}\n\n{instruction}"
+
+
+def extract_output_file_candidates(*texts: str) -> list[str]:
+    candidates: list[str] = []
+    for text in texts:
+        if not text:
+            continue
+        candidates.extend(match.group("path").strip() for match in OUTPUT_FILE_LINE_RE.finditer(text))
+    if candidates:
+        return candidates
+
+    for text in texts:
+        if not text:
+            continue
+        for match in FALLBACK_OUTPUT_PATH_RE.finditer(text):
+            path = match.group("path").strip().rstrip(").,;:!?")
+            if path:
+                candidates.append(path)
+    return candidates
+
+
+def strip_output_file_lines(text: str) -> str:
+    lines = [line for line in str(text or "").splitlines() if not OUTPUT_FILE_LINE_RE.match(line)]
+    return "\n".join(lines).strip()
+
+
+def resolve_output_file_path(raw_path: str) -> Path | None:
+    candidate = str(raw_path or "").strip().strip('"').strip("'")
+    if not candidate:
+        return None
+    path = Path(candidate)
+    if not path.is_absolute():
+        path = Path(HOST_WORKSPACE) / path
+    try:
+        resolved = path.resolve(strict=True)
+    except Exception:
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
 
 
 def extract_last_meaningful_text(output: str) -> str:
@@ -2895,6 +3089,43 @@ def tail_text(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[-limit:]
+
+
+def guess_telegram_mime_type(file_path: Path) -> str:
+    suffix = file_path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".webp":
+        return "image/webp"
+    if suffix == ".gif":
+        return "image/gif"
+    if suffix == ".pdf":
+        return "application/pdf"
+    if suffix == ".txt":
+        return "text/plain"
+    if suffix == ".json":
+        return "application/json"
+    if suffix == ".csv":
+        return "text/csv"
+    if suffix == ".md":
+        return "text/markdown"
+    if suffix == ".html":
+        return "text/html"
+    return "application/octet-stream"
+
+
+def format_bytes(value: int) -> str:
+    size = float(max(0, int(value)))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    index = 0
+    while size >= 1024 and index < len(units) - 1:
+        size /= 1024
+        index += 1
+    if index == 0:
+        return f"{int(size)} {units[index]}"
+    return f"{size:.1f} {units[index]}"
 
 
 def strip_ansi(value: str) -> str:
