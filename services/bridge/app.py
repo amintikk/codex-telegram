@@ -127,6 +127,7 @@ STT_COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "int8").strip() or "int8"
 STT_MODEL_DIR = Path(os.environ.get("STT_MODEL_DIR", "/data/stt-models"))
 TTS_VOICE = os.environ.get("TTS_VOICE", "es").strip() or "es"
 TTS_SPEED = int(os.environ.get("TTS_SPEED", "165").strip() or "165")
+TTS_PITCH = int(os.environ.get("TTS_PITCH", "45").strip() or "45")
 TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "5000").strip() or "5000")
 PHOTO_OUTPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 OUTPUT_FILE_LINE_RE = re.compile(r"^\s*OUTPUT_FILE:\s*(?P<path>.+?)\s*$", re.MULTILINE)
@@ -305,26 +306,26 @@ class CodexTelegramBridge:
                 continue
         raise BotError(last_error or "Telegram rejected the file upload.")
 
-    def send_audio_response(
+    def send_voice_response(
         self,
         chat_id: str,
-        audio_path: Path,
+        voice_path: Path,
         *,
         reply_to_message_id: int | None = None,
     ) -> None:
         data: dict[str, Any] = {"chat_id": chat_id}
         if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
-        with audio_path.open("rb") as handle:
+        with voice_path.open("rb") as handle:
             files = {
-                "audio": (
-                    audio_path.name,
+                "voice": (
+                    voice_path.name,
                     handle,
-                    "audio/mpeg",
+                    "audio/ogg",
                 )
             }
             response = self.session.post(
-                f"{self.base_url}/sendAudio",
+                f"{self.base_url}/sendVoice",
                 data=data,
                 files=files,
                 timeout=300,
@@ -332,7 +333,7 @@ class CodexTelegramBridge:
         response.raise_for_status()
         payload = response.json()
         if not payload.get("ok"):
-            raise BotError(payload.get("description") or "Telegram rejected the audio upload.")
+            raise BotError(payload.get("description") or "Telegram rejected the voice upload.")
 
     def send_output_attachments(
         self,
@@ -480,7 +481,7 @@ class CodexTelegramBridge:
             raise BotError("There is no text available for audio playback.")
         limited_text = plain_text[:TTS_MAX_CHARS].strip()
         wav_path = RUNS_DIR / f"tts-{uuid.uuid4().hex}.wav"
-        mp3_path = wav_path.with_suffix(".mp3")
+        voice_path = wav_path.with_suffix(".ogg")
         subprocess.run(
             [
                 "espeak-ng",
@@ -488,6 +489,8 @@ class CodexTelegramBridge:
                 TTS_VOICE,
                 "-s",
                 str(TTS_SPEED),
+                "-p",
+                str(TTS_PITCH),
                 "-w",
                 str(wav_path),
                 limited_text,
@@ -503,11 +506,17 @@ class CodexTelegramBridge:
                 "-y",
                 "-i",
                 str(wav_path),
-                "-codec:a",
-                "libmp3lame",
+                "-ac",
+                "1",
+                "-ar",
+                "48000",
+                "-c:a",
+                "libopus",
                 "-b:a",
-                "64k",
-                str(mp3_path),
+                "32k",
+                "-application",
+                "voip",
+                str(voice_path),
             ],
             check=True,
             stdout=subprocess.PIPE,
@@ -515,7 +524,7 @@ class CodexTelegramBridge:
             text=True,
         )
         wav_path.unlink(missing_ok=True)
-        return mp3_path
+        return voice_path
 
     def cleanup_expired_uploads(self, *, force: bool = False) -> None:
         now = time.time()
@@ -1045,7 +1054,7 @@ class CodexTelegramBridge:
                 self.send_chat_action(chat_id, "upload_voice")
                 audio_path = self.synthesize_speech(result)
                 try:
-                    self.send_audio_response(
+                    self.send_voice_response(
                         chat_id,
                         audio_path,
                         reply_to_message_id=message_id,
