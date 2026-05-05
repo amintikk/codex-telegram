@@ -257,11 +257,15 @@ class CodexTelegramBridge:
         text: str,
         *,
         reply_markup: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
+        rendered_text = str(text or "")
+        if len(rendered_text) > 3900:
+            rendered_text = rendered_text[:3890].rstrip() + "…"
+
         data: dict[str, Any] = {
             "chat_id": chat_id,
             "message_id": message_id,
-            "text": text,
+            "text": rendered_text,
             "parse_mode": TELEGRAM_PARSE_MODE,
             "disable_web_page_preview": True,
         }
@@ -269,10 +273,38 @@ class CodexTelegramBridge:
             data["reply_markup"] = json.dumps(reply_markup)
         try:
             self._telegram("editMessageText", data=data)
-        except BotError as exc:
-            if "message is not modified" in str(exc).lower():
-                return
-            raise
+            return True
+        except Exception as exc:
+            error_text = str(exc).lower()
+            if "message is not modified" in error_text:
+                return True
+            if any(
+                fragment in error_text
+                for fragment in (
+                    "message to edit not found",
+                    "message can't be edited",
+                    "message identifier is not specified",
+                    "chat not found",
+                )
+            ):
+                return False
+
+            plain_text = html_to_plain_text(rendered_text).strip() or "Working..."
+            if len(plain_text) > 3900:
+                plain_text = plain_text[:3890].rstrip() + "…"
+            fallback_data = {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": plain_text,
+                "disable_web_page_preview": True,
+            }
+            if reply_markup is not None:
+                fallback_data["reply_markup"] = json.dumps(reply_markup)
+            try:
+                self._telegram("editMessageText", data=fallback_data)
+                return True
+            except Exception:
+                return False
 
     def send_markdown(
         self,
@@ -2967,11 +2999,13 @@ class CodexTelegramBridge:
         now = time.time()
         if not force and now - float(progress_state.get("last_render_at") or 0.0) < 0.8:
             return
-        self.edit_message(
+        updated = self.edit_message(
             str(chat_id),
             int(message_id),
             self.build_progress_text(progress_state, status),
         )
+        if not updated:
+            progress_state["message_id"] = None
         progress_state["last_render_at"] = now
 
     def finish_progress_state(self, progress_state: dict[str, Any], status: str) -> None:
