@@ -29,6 +29,8 @@ It supports:
 - per-chat login with official device auth
 - persistent chat sessions with `/new`
 - image input from Telegram photos and image documents
+- audio input from Telegram voice notes and audio files
+- audio replies for voice-driven chats
 - live progress updates in a single Telegram message while Codex works
 - host workspace access
 - full host shell access when `HOST_SHELL_MODE=host`
@@ -83,6 +85,7 @@ list all running docker containers on this machine
 | Command | Purpose |
 | --- | --- |
 | any plain message | Run the prompt through Codex |
+| voice note or audio file | Transcribe the audio and run it as the prompt |
 | photo or image document | Send the image to Codex, using the caption as the prompt when present |
 | `/run <prompt>` | Run a task explicitly |
 | `/login` | Start official Codex login for this chat |
@@ -126,6 +129,9 @@ Use this only for a private single-operator setup.
 | `CODEX_CHANNEL` | npm channel or exact version |
 | `CODEX_MODEL` | Optional model override |
 | `CODEX_EXTRA_ARGS` | Extra flags passed to `codex exec` |
+| `STT_MODEL` | Faster-Whisper model name for audio transcription |
+| `STT_LANGUAGE` | Optional transcription language hint, for example `es` |
+| `TTS_VOICE` | Edge TTS voice used for audio replies |
 
 ## Sessions
 

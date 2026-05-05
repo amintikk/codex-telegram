@@ -8,6 +8,8 @@ RUN apt-get update \
         ca-certificates \
         curl \
         docker.io \
+        espeak-ng \
+        ffmpeg \
         git \
         jq \
         python3 \

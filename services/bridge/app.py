@@ -15,6 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
+from faster_whisper import WhisperModel
 import requests
 
 
@@ -120,8 +121,16 @@ TELEGRAM_SEND_FILE_MAX_BYTES = int(
     os.environ.get("TELEGRAM_SEND_FILE_MAX_BYTES", str(49 * 1024 * 1024)).strip()
     or str(49 * 1024 * 1024)
 )
+STT_MODEL_NAME = os.environ.get("STT_MODEL", "base").strip() or "base"
+STT_LANGUAGE = os.environ.get("STT_LANGUAGE", "").strip()
+STT_COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "int8").strip() or "int8"
+STT_MODEL_DIR = Path(os.environ.get("STT_MODEL_DIR", "/data/stt-models"))
+TTS_VOICE = os.environ.get("TTS_VOICE", "es").strip() or "es"
+TTS_SPEED = int(os.environ.get("TTS_SPEED", "165").strip() or "165")
+TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "5000").strip() or "5000")
 PHOTO_OUTPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 OUTPUT_FILE_LINE_RE = re.compile(r"^\s*OUTPUT_FILE:\s*(?P<path>.+?)\s*$", re.MULTILINE)
+AUDIO_INPUT_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".oga", ".opus", ".aac", ".flac", ".mp4", ".mpeg"}
 
 
 class BotError(RuntimeError):
@@ -143,12 +152,15 @@ class CodexTelegramBridge:
         self.last_update_check = 0.0
         self.last_upload_cleanup = 0.0
         self.models_cache: dict[str, dict[str, Any]] = {}
+        self.stt_model: WhisperModel | None = None
         self.state_lock = threading.Lock()
         self.login_lock = threading.Lock()
+        self.stt_lock = threading.Lock()
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         TELEGRAM_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         CODEX_AUTH_ROOT.mkdir(parents=True, exist_ok=True)
+        STT_MODEL_DIR.mkdir(parents=True, exist_ok=True)
         self._load_state()
         self.cleanup_expired_uploads(force=True)
         self.register_bot_commands()
@@ -293,6 +305,35 @@ class CodexTelegramBridge:
                 continue
         raise BotError(last_error or "Telegram rejected the file upload.")
 
+    def send_audio_response(
+        self,
+        chat_id: str,
+        audio_path: Path,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        data: dict[str, Any] = {"chat_id": chat_id}
+        if reply_to_message_id:
+            data["reply_to_message_id"] = reply_to_message_id
+        with audio_path.open("rb") as handle:
+            files = {
+                "audio": (
+                    audio_path.name,
+                    handle,
+                    "audio/mpeg",
+                )
+            }
+            response = self.session.post(
+                f"{self.base_url}/sendAudio",
+                data=data,
+                files=files,
+                timeout=300,
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise BotError(payload.get("description") or "Telegram rejected the audio upload.")
+
     def send_output_attachments(
         self,
         chat_id: str,
@@ -400,6 +441,81 @@ class CodexTelegramBridge:
         response = self.session.get(file_url, timeout=120)
         response.raise_for_status()
         destination.write_bytes(response.content)
+
+    def get_stt_model(self) -> WhisperModel:
+        with self.stt_lock:
+            if self.stt_model is None:
+                self.stt_model = WhisperModel(
+                    STT_MODEL_NAME,
+                    device="cpu",
+                    compute_type=STT_COMPUTE_TYPE,
+                    download_root=str(STT_MODEL_DIR),
+                )
+            return self.stt_model
+
+    def transcribe_audio_file(self, audio_path: Path) -> str:
+        model = self.get_stt_model()
+        options: dict[str, Any] = {
+            "vad_filter": True,
+        }
+        if STT_LANGUAGE:
+            options["language"] = STT_LANGUAGE
+        segments, _info = model.transcribe(str(audio_path), **options)
+        parts = [segment.text.strip() for segment in segments if str(segment.text or "").strip()]
+        return " ".join(parts).strip()
+
+    def build_audio_prompt(self, transcript: str, caption: str) -> str:
+        normalized_caption = caption.strip()
+        if normalized_caption.startswith("/run "):
+            normalized_caption = normalized_caption[5:].strip()
+        elif normalized_caption.startswith("/run"):
+            normalized_caption = ""
+        if normalized_caption:
+            return f"{normalized_caption}\n\nVoice transcript:\n{transcript}"
+        return transcript
+
+    def synthesize_speech(self, text: str) -> Path:
+        plain_text = collapse_whitespace(html_to_plain_text(text))
+        if not plain_text:
+            raise BotError("There is no text available for audio playback.")
+        limited_text = plain_text[:TTS_MAX_CHARS].strip()
+        wav_path = RUNS_DIR / f"tts-{uuid.uuid4().hex}.wav"
+        mp3_path = wav_path.with_suffix(".mp3")
+        subprocess.run(
+            [
+                "espeak-ng",
+                "-v",
+                TTS_VOICE,
+                "-s",
+                str(TTS_SPEED),
+                "-w",
+                str(wav_path),
+                limited_text,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(wav_path),
+                "-codec:a",
+                "libmp3lame",
+                "-b:a",
+                "64k",
+                str(mp3_path),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        wav_path.unlink(missing_ok=True)
+        return mp3_path
 
     def cleanup_expired_uploads(self, *, force: bool = False) -> None:
         now = time.time()
@@ -533,6 +649,33 @@ class CodexTelegramBridge:
 
         return None, None, None
 
+    def resolve_message_audio(self, message: dict[str, Any]) -> tuple[Path | None, str | None]:
+        voice = message.get("voice")
+        if isinstance(voice, dict):
+            file_id = str(voice.get("file_id") or "").strip()
+            if not file_id:
+                return None, None
+            file_path = self.get_telegram_file_path(file_id)
+            suffix = Path(file_path).suffix or ".ogg"
+            destination = TELEGRAM_UPLOADS_DIR / f"{uuid.uuid4().hex}-voice{suffix}"
+            self.download_telegram_file(file_path, destination)
+            return destination, destination.name
+
+        audio = message.get("audio")
+        if isinstance(audio, dict):
+            file_id = str(audio.get("file_id") or "").strip()
+            if not file_id:
+                return None, None
+            file_name = str(audio.get("file_name") or "")
+            suffix = Path(file_name).suffix.lower() or Path(str(audio.get("file_path") or "")).suffix.lower() or ".mp3"
+            safe_name = self.build_safe_upload_name(file_name or f"audio{suffix}", suffix)
+            destination = TELEGRAM_UPLOADS_DIR / f"{uuid.uuid4().hex}-{safe_name}"
+            file_path = self.get_telegram_file_path(file_id)
+            self.download_telegram_file(file_path, destination)
+            return destination, file_name or destination.name
+
+        return None, None
+
     def register_bot_commands(self) -> None:
         commands = [
             {"command": "login", "description": "Connect Codex for this chat"},
@@ -624,7 +767,7 @@ class CodexTelegramBridge:
                     [
                         "<b>Codex Telegram Bridge</b>",
                         "Send any message and it will be forwarded to Codex CLI.",
-                        "You can also send photos or documents such as text, code, SQL, JSON, and similar files.",
+                        "You can also send photos, audio notes, audio files, or documents such as text, code, SQL, JSON, and similar files.",
                         "",
                         "<b>Commands</b>",
                         "<code>/login</code> connect Codex for this chat",
@@ -736,6 +879,7 @@ class CodexTelegramBridge:
         *,
         image_paths: list[Path] | None = None,
         attachment_paths: list[Path] | None = None,
+        prefer_audio_response: bool = False,
     ) -> None:
         image_paths = image_paths or []
         attachment_paths = attachment_paths or []
@@ -769,6 +913,7 @@ class CodexTelegramBridge:
             "prompt": prompt,
             "image_paths": image_paths,
             "attachment_paths": attachment_paths,
+            "prefer_audio_response": prefer_audio_response,
         }
         queue_position = self.enqueue_or_start_job(job)
         if queue_position is not None:
@@ -836,6 +981,7 @@ class CodexTelegramBridge:
         message_id = int(job.get("message_id") or 0)
         image_paths = list(job.get("image_paths") or [])
         attachment_paths = list(job.get("attachment_paths") or [])
+        prefer_audio_response = bool(job.get("prefer_audio_response"))
 
         typing_stop = threading.Event()
         typing_thread = threading.Thread(
@@ -860,6 +1006,7 @@ class CodexTelegramBridge:
                 message_id,
                 image_paths,
                 attachment_paths,
+                prefer_audio_response,
                 progress_message_id,
                 typing_stop,
                 typing_thread,
@@ -875,6 +1022,7 @@ class CodexTelegramBridge:
         message_id: int,
         image_paths: list[Path],
         attachment_paths: list[Path],
+        prefer_audio_response: bool,
         progress_message_id: int | None,
         typing_stop: threading.Event,
         typing_thread: threading.Thread,
@@ -893,6 +1041,17 @@ class CodexTelegramBridge:
                 reply_to_message_id=message_id,
                 already_formatted=already_formatted,
             )
+            if prefer_audio_response:
+                self.send_chat_action(chat_id, "upload_voice")
+                audio_path = self.synthesize_speech(result)
+                try:
+                    self.send_audio_response(
+                        chat_id,
+                        audio_path,
+                        reply_to_message_id=message_id,
+                    )
+                finally:
+                    audio_path.unlink(missing_ok=True)
             self.send_output_attachments(
                 chat_id,
                 output_files,
@@ -2735,6 +2894,7 @@ class CodexTelegramBridge:
         caption = (message.get("caption") or "").strip()
         message_id = int(message.get("message_id") or 0)
         has_attachment_message = bool(message.get("photo")) or isinstance(message.get("document"), dict)
+        has_audio_message = isinstance(message.get("voice"), dict) or isinstance(message.get("audio"), dict)
 
         if not chat_id:
             return
@@ -2746,6 +2906,47 @@ class CodexTelegramBridge:
 
         if text:
             self.handle_command(chat_id, text, message_id)
+            return
+
+        if has_audio_message:
+            audio_path, original_name = self.resolve_message_audio(message)
+            if audio_path is None:
+                self.send_markdown(
+                    chat_id,
+                    "<b>Audio not available</b>\nTelegram did not provide a usable audio file.",
+                    reply_to_message_id=message_id,
+                    already_formatted=True,
+                )
+                return
+            try:
+                self.send_chat_action(chat_id, "typing")
+                transcript = self.transcribe_audio_file(audio_path)
+            except Exception as exc:
+                self.send_markdown(
+                    chat_id,
+                    f"<b>Transcription failed</b>\n{escape_html(str(exc))}",
+                    reply_to_message_id=message_id,
+                    already_formatted=True,
+                )
+                self.cleanup_attachment_paths([audio_path])
+                return
+            if not transcript:
+                self.send_markdown(
+                    chat_id,
+                    "<b>No speech detected</b>",
+                    reply_to_message_id=message_id,
+                    already_formatted=True,
+                )
+                self.cleanup_attachment_paths([audio_path])
+                return
+            prompt = self.build_audio_prompt(transcript, caption)
+            self.run_prompt(
+                chat_id,
+                prompt,
+                message_id,
+                attachment_paths=[audio_path],
+                prefer_audio_response=True,
+            )
             return
 
         if not has_attachment_message:
@@ -3325,10 +3526,14 @@ def first_visible_line(value: str) -> str:
 
 
 def shorten_text(value: str, limit: int) -> str:
-    text = re.sub(r"\s+", " ", str(value or "").strip())
+    text = collapse_whitespace(value)
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def collapse_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
 
 
 def shorten_command(command: str, limit: int) -> str:
