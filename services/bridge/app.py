@@ -124,19 +124,44 @@ TELEGRAM_SEND_FILE_MAX_BYTES = int(
     or str(49 * 1024 * 1024)
 )
 STT_MODEL_NAME = os.environ.get("STT_MODEL", "base").strip() or "base"
+VOICE_LOCALE = os.environ.get("VOICE_LOCALE", "en_US").strip() or "en_US"
 STT_LANGUAGE = os.environ.get("STT_LANGUAGE", "").strip()
 STT_COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "int8").strip() or "int8"
 STT_MODEL_DIR = Path(os.environ.get("STT_MODEL_DIR", "/data/stt-models"))
-TTS_VOICE = os.environ.get("TTS_VOICE", "es+f3").strip() or "es+f3"
+TTS_VOICE = os.environ.get("TTS_VOICE", "").strip()
 TTS_SPEED = int(os.environ.get("TTS_SPEED", "150").strip() or "150")
 TTS_PITCH = int(os.environ.get("TTS_PITCH", "32").strip() or "32")
 TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "5000").strip() or "5000")
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "piper").strip().lower() or "piper"
-TTS_PIPER_VOICE = os.environ.get("TTS_PIPER_VOICE", "es_ES-sharvard-medium").strip() or "es_ES-sharvard-medium"
+TTS_PIPER_VOICE = os.environ.get("TTS_PIPER_VOICE", "").strip()
 TTS_PIPER_DIR = Path(os.environ.get("TTS_PIPER_DIR", "/data/piper-voices"))
 PHOTO_OUTPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 OUTPUT_FILE_LINE_RE = re.compile(r"^\s*OUTPUT_FILE:\s*(?P<path>.+?)\s*$", re.MULTILINE)
 AUDIO_INPUT_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".oga", ".opus", ".aac", ".flac", ".mp4", ".mpeg"}
+PIPER_VOICE_PRESETS = {
+    "en_US": "en_US-lessac-high",
+    "en_GB": "en_GB-cori-high",
+    "es_ES": "es_ES-sharvard-medium",
+    "es_MX": "es_MX-claude-high",
+    "es_AR": "es_AR-daniela-high",
+    "fr_FR": "fr_FR-siwis-medium",
+    "de_DE": "de_DE-thorsten-high",
+    "it_IT": "it_IT-paola-medium",
+    "pt_BR": "pt_BR-faber-medium",
+    "pt_PT": "pt_PT-tugão-medium",
+}
+ESPEAK_VOICE_PRESETS = {
+    "en_US": "en-us",
+    "en_GB": "en-gb",
+    "es_ES": "es",
+    "es_MX": "es-la",
+    "es_AR": "es-la",
+    "fr_FR": "fr-fr",
+    "de_DE": "de",
+    "it_IT": "it",
+    "pt_BR": "pt-br",
+    "pt_PT": "pt-pt",
+}
 
 
 class BotError(RuntimeError):
@@ -483,9 +508,51 @@ class CodexTelegramBridge:
             return f"{normalized_caption}\n\nVoice transcript:\n{transcript}"
         return transcript
 
+    def resolve_stt_language(self) -> str:
+        if STT_LANGUAGE:
+            return STT_LANGUAGE
+        if "_" in VOICE_LOCALE:
+            return VOICE_LOCALE.split("_", 1)[0].lower()
+        if "-" in VOICE_LOCALE:
+            return VOICE_LOCALE.split("-", 1)[0].lower()
+        return VOICE_LOCALE.lower()
+
+    def resolve_piper_voice_name(self) -> str:
+        if TTS_PIPER_VOICE:
+            return TTS_PIPER_VOICE
+        direct_match = PIPER_VOICE_PRESETS.get(VOICE_LOCALE)
+        if direct_match:
+            return direct_match
+        normalized_locale = VOICE_LOCALE.replace("-", "_")
+        direct_match = PIPER_VOICE_PRESETS.get(normalized_locale)
+        if direct_match:
+            return direct_match
+        language = self.resolve_stt_language()
+        for locale_key, voice_name in PIPER_VOICE_PRESETS.items():
+            if locale_key.lower().startswith(f"{language}_".lower()):
+                return voice_name
+        return "en_US-lessac-high"
+
+    def resolve_espeak_voice_name(self) -> str:
+        if TTS_VOICE:
+            return TTS_VOICE
+        direct_match = ESPEAK_VOICE_PRESETS.get(VOICE_LOCALE)
+        if direct_match:
+            return direct_match
+        normalized_locale = VOICE_LOCALE.replace("-", "_")
+        direct_match = ESPEAK_VOICE_PRESETS.get(normalized_locale)
+        if direct_match:
+            return direct_match
+        language = self.resolve_stt_language()
+        for locale_key, voice_name in ESPEAK_VOICE_PRESETS.items():
+            if locale_key.lower().startswith(f"{language}_".lower()):
+                return voice_name
+        return "en-us"
+
     def ensure_piper_voice_files(self) -> tuple[Path, Path]:
-        model_path = TTS_PIPER_DIR / f"{TTS_PIPER_VOICE}.onnx"
-        config_path = TTS_PIPER_DIR / f"{TTS_PIPER_VOICE}.onnx.json"
+        voice_name = self.resolve_piper_voice_name()
+        model_path = TTS_PIPER_DIR / f"{voice_name}.onnx"
+        config_path = TTS_PIPER_DIR / f"{voice_name}.onnx.json"
         if model_path.exists() and config_path.exists():
             return model_path, config_path
         subprocess.run(
@@ -495,7 +562,7 @@ class CodexTelegramBridge:
                 "piper.download_voices",
                 "--download-dir",
                 str(TTS_PIPER_DIR),
-                TTS_PIPER_VOICE,
+                voice_name,
             ],
             check=True,
             stdout=subprocess.PIPE,
@@ -503,7 +570,7 @@ class CodexTelegramBridge:
             text=True,
         )
         if not model_path.exists() or not config_path.exists():
-            raise BotError(f"Unable to download Piper voice {TTS_PIPER_VOICE}.")
+            raise BotError(f"Unable to download Piper voice {voice_name}.")
         return model_path, config_path
 
     def get_piper_voice(self) -> PiperVoice:
@@ -523,11 +590,12 @@ class CodexTelegramBridge:
             voice.synthesize_wav(text, wav_file)
 
     def synthesize_speech_with_espeak(self, text: str, wav_path: Path) -> None:
+        voice_name = self.resolve_espeak_voice_name()
         subprocess.run(
             [
                 "espeak-ng",
                 "-v",
-                TTS_VOICE,
+                voice_name,
                 "-s",
                 str(TTS_SPEED),
                 "-p",

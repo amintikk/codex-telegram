@@ -31,6 +31,7 @@ It supports:
 - image input from Telegram photos and image documents
 - audio input from Telegram voice notes and audio files
 - audio replies for voice-driven chats
+- language-aware voice defaults through `VOICE_LOCALE`
 - live progress updates in a single Telegram message while Codex works
 - host workspace access
 - full host shell access when `HOST_SHELL_MODE=host`
@@ -58,6 +59,7 @@ CODEX_AUTH_ROOT=/data/auth
 HOST_WORKSPACE=/home/ubuntu
 HOST_SHELL_MODE=host
 CODEX_CHANNEL=latest
+VOICE_LOCALE=en_US
 ```
 
 5. Start it:
@@ -129,9 +131,47 @@ Use this only for a private single-operator setup.
 | `CODEX_CHANNEL` | npm channel or exact version |
 | `CODEX_MODEL` | Optional model override |
 | `CODEX_EXTRA_ARGS` | Extra flags passed to `codex exec` |
+| `VOICE_LOCALE` | Default locale for voice input/output, for example `en_US`, `es_ES`, `fr_FR` |
 | `STT_MODEL` | Faster-Whisper model name for audio transcription |
-| `STT_LANGUAGE` | Optional transcription language hint, for example `es` |
-| `TTS_VOICE` | Edge TTS voice used for audio replies |
+| `STT_LANGUAGE` | Optional transcription language hint. Leave it empty to derive it from `VOICE_LOCALE` |
+| `TTS_ENGINE` | Voice engine. `piper` is the recommended default |
+| `TTS_PIPER_VOICE` | Optional explicit Piper voice. Leave it empty to auto-pick from `VOICE_LOCALE` |
+| `TTS_VOICE` | `espeak-ng` fallback voice used only if Piper fails |
+
+## Voice locales
+
+You can keep voice setup simple by setting only `VOICE_LOCALE`.
+
+Built-in presets:
+
+| Locale | Auto-selected Piper voice |
+| --- | --- |
+| `en_US` | `en_US-lessac-high` |
+| `en_GB` | `en_GB-cori-high` |
+| `es_ES` | `es_ES-sharvard-medium` |
+| `es_MX` | `es_MX-claude-high` |
+| `es_AR` | `es_AR-daniela-high` |
+| `fr_FR` | `fr_FR-siwis-medium` |
+| `de_DE` | `de_DE-thorsten-high` |
+| `it_IT` | `it_IT-paola-medium` |
+| `pt_BR` | `pt_BR-faber-medium` |
+| `pt_PT` | `pt_PT-tugão-medium` |
+
+Examples:
+
+```env
+VOICE_LOCALE=en_US
+```
+
+```env
+VOICE_LOCALE=es_ES
+```
+
+```env
+VOICE_LOCALE=fr_FR
+```
+
+If you want a specific Piper voice instead of the preset, set `TTS_PIPER_VOICE` directly.
 
 ## Sessions
 
