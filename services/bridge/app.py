@@ -337,23 +337,14 @@ class CodexTelegramBridge:
             except Exception as exc:
                 skipped.append(f"{file_path.name}: {str(exc)}")
 
-        if not sent_names and not skipped:
+        if not skipped:
             return
 
-        rows = []
-        if sent_names:
-            rows.append(("Sent", str(len(sent_names))))
-        if skipped:
-            rows.append(("Skipped", str(len(skipped))))
+        rows = [("Skipped", str(len(skipped)))]
         blocks = [self.render_kv_block(rows)] if rows else []
-        if sent_names:
-            blocks.append(
-                "<pre>" + escape_html("Delivered\n" + "\n".join(f"- {name}" for name in sent_names[:8])) + "</pre>"
-            )
-        if skipped:
-            blocks.append(
-                "<pre>" + escape_html("Skipped\n" + "\n".join(f"- {item}" for item in skipped[:8])) + "</pre>"
-            )
+        blocks.append(
+            "<pre>" + escape_html("Skipped\n" + "\n".join(f"- {item}" for item in skipped[:8])) + "</pre>"
+        )
         self.send_markdown(
             chat_id,
             self.render_panel("Files", "\n\n".join(blocks)),
