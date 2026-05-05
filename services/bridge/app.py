@@ -2959,9 +2959,7 @@ class CodexTelegramBridge:
     def format_progress_event(self, payload: dict[str, Any]) -> str:
         event_type = str(payload.get("type") or "").strip()
         if event_type == "thread.started":
-            thread_id = str(payload.get("thread_id") or "").strip()
-            short_id = thread_id[:12] if thread_id else "new thread"
-            return f"thread started: <code>{escape_html(short_id)}</code>"
+            return None
 
         if event_type == "turn.started":
             return "⚙️ turn started"
