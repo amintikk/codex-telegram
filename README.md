@@ -138,9 +138,15 @@ Use this only for a private single-operator setup.
 | `VOICE_LOCALE` | Default locale for voice input/output, for example `en_US`, `es_ES`, `fr_FR` |
 | `STT_MODEL` | Faster-Whisper model name for audio transcription |
 | `STT_LANGUAGE` | Optional transcription language hint. Leave it empty to derive it from `VOICE_LOCALE` |
+| `STT_COMPUTE_TYPE` | Whisper compute mode, for example `int8` on CPU |
+| `STT_MODEL_DIR` | Directory where Faster-Whisper models are cached |
 | `TTS_ENGINE` | Voice engine. `piper` is the recommended default |
 | `TTS_PIPER_VOICE` | Optional explicit Piper voice. Leave it empty to auto-pick from `VOICE_LOCALE` |
+| `TTS_PIPER_DIR` | Directory where Piper voice models are cached |
 | `TTS_VOICE` | `espeak-ng` fallback voice used only if Piper fails |
+| `TTS_SPEED` | `espeak-ng` fallback speed |
+| `TTS_PITCH` | `espeak-ng` fallback pitch |
+| `TTS_MAX_CHARS` | Maximum text length synthesized into a single audio reply |
 
 ## Voice locales
 
@@ -177,6 +183,29 @@ VOICE_LOCALE=fr_FR
 
 If you want a specific Piper voice instead of the preset, set `TTS_PIPER_VOICE` directly.
 
+## Voice behavior
+
+The bridge supports both speech-to-text and text-to-speech:
+
+- if the user sends a Telegram voice note or audio file, the bridge transcribes it and runs the transcript through Codex
+- voice-driven chats get a voice reply back automatically
+- normal text messages still get a text reply by default
+
+Recommended voice setup:
+
+```env
+VOICE_LOCALE=en_US
+TTS_ENGINE=piper
+TTS_PIPER_VOICE=
+STT_LANGUAGE=
+```
+
+This keeps the setup simple:
+
+- transcription language is inferred from `VOICE_LOCALE`
+- Piper auto-selects a matching voice preset
+- the model files are cached under `STT_MODEL_DIR` and `TTS_PIPER_DIR`
+
 ## Progress panel
 
 The Telegram progress panel is configurable from `.env`.
@@ -190,6 +219,9 @@ PROGRESS_MAX_ACTIVE_COMMANDS=6
 
 - `current`: shows only what Codex is doing right now
 - `log`: keeps the short stacked event history
+- `PROGRESS_IDLE_TEXT`: changes the text shown when Codex is thinking with no active commands
+- `PROGRESS_INCLUDE_AGENT_NOTES`: shows or hides short agent notes in the panel
+- `PROGRESS_MAX_ACTIVE_COMMANDS`: limits how many concurrent commands are shown at once
 
 ## Sessions
 
