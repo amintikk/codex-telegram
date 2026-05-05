@@ -1133,9 +1133,10 @@ class CodexTelegramBridge:
             daemon=True,
         )
         typing_thread.start()
+        initial_progress_state = self.create_progress_state(chat_id, None)
         progress_message_id = self.send_panel(
             chat_id,
-            self.build_progress_text([], "Working"),
+            self.build_progress_text(initial_progress_state, "Working"),
             reply_to_message_id=message_id or None,
         )
         with self.state_lock:
@@ -1208,10 +1209,12 @@ class CodexTelegramBridge:
                 already_formatted=True,
             )
             if progress_message_id:
+                failed_progress_state = self.create_progress_state(chat_id, progress_message_id)
+                failed_progress_state["error"] = str(exc)
                 self.edit_message(
                     chat_id,
                     progress_message_id,
-                    self.build_progress_text([], "Failed"),
+                    self.build_progress_text(failed_progress_state, "Failed"),
                 )
         finally:
             typing_stop.set()
@@ -2894,26 +2897,42 @@ class CodexTelegramBridge:
         return {
             "chat_id": chat_id,
             "message_id": message_id,
-            "lines": [],
+            "active_commands": {},
+            "note": "",
+            "error": "",
             "last_render_at": 0.0,
         }
 
-    def build_progress_text(self, lines: list[str], status: str) -> str:
-        rendered_lines = lines[-12:] if lines else ["⏳ preparing..."]
-        return "\n".join(
-            [
-                f"<b>{escape_html(status)}</b>",
-                "",
-                *rendered_lines,
-            ]
-        )
+    def build_progress_text(self, progress_state: dict[str, Any], status: str) -> str:
+        lines: list[str] = []
+        error_text = str(progress_state.get("error") or "").strip()
+        note_text = str(progress_state.get("note") or "").strip()
+        active_commands = list((progress_state.get("active_commands") or {}).values())
 
-    def append_progress_line(self, progress_state: dict[str, Any], line: str) -> None:
-        clean = str(line or "").strip()
-        if not clean:
-            return
-        progress_state["lines"].append(clean)
-        progress_state["lines"] = progress_state["lines"][-20:]
+        if error_text:
+            lines.append(f"error: {escape_html(shorten_text(error_text, 180))}")
+        elif active_commands:
+            for command in active_commands[:6]:
+                lines.append(f"run: <code>{escape_html(shorten_command(command, 110))}</code>")
+        elif note_text:
+            lines.append(escape_html(shorten_text(note_text, 180)))
+        else:
+            lines.append("thinking...")
+
+        if note_text and active_commands:
+            lines.append("")
+            lines.append(escape_html(shorten_text(note_text, 180)))
+
+        return "\n".join([f"<b>{escape_html(status)}</b>", "", *lines])
+
+    def get_progress_command_key(self, item: dict[str, Any]) -> str:
+        item_id = str(item.get("id") or "").strip()
+        if item_id:
+            return item_id
+        command = str(item.get("command") or "").strip()
+        if command:
+            return command
+        return str(uuid.uuid4())
 
     def flush_progress_state(self, progress_state: dict[str, Any], *, force: bool = False, status: str = "Working") -> None:
         message_id = progress_state.get("message_id")
@@ -2926,7 +2945,7 @@ class CodexTelegramBridge:
         self.edit_message(
             str(chat_id),
             int(message_id),
-            self.build_progress_text(list(progress_state.get("lines") or []), status),
+            self.build_progress_text(progress_state, status),
         )
         progress_state["last_render_at"] = now
 
@@ -2950,19 +2969,21 @@ class CodexTelegramBridge:
         except json.JSONDecodeError:
             return
 
-        rendered = self.format_progress_event(payload)
-        if not rendered:
+        changed = self.apply_progress_event(progress_state, payload)
+        if not changed:
             return
-        self.append_progress_line(progress_state, rendered)
         self.flush_progress_state(progress_state)
 
-    def format_progress_event(self, payload: dict[str, Any]) -> str:
+    def apply_progress_event(self, progress_state: dict[str, Any], payload: dict[str, Any]) -> bool:
         event_type = str(payload.get("type") or "").strip()
         if event_type == "thread.started":
-            return None
+            return False
 
         if event_type == "turn.started":
-            return "⚙️ turn started"
+            progress_state["error"] = ""
+            if not progress_state.get("note"):
+                progress_state["note"] = "thinking..."
+            return True
 
         if event_type in {"error", "turn.failed"}:
             message = ""
@@ -2972,17 +2993,22 @@ class CodexTelegramBridge:
                 error_payload = payload.get("error")
                 if isinstance(error_payload, dict):
                     message = str(error_payload.get("message") or "").strip()
-            if message:
-                return f"error: {escape_html(shorten_text(message, 140))}"
-            return "task failed"
+            progress_state["error"] = message or "task failed"
+            return True
 
         if event_type == "item.started":
             item = payload.get("item") or {}
             item_type = str(item.get("type") or "").strip()
             if item_type == "command_execution":
                 command = str(item.get("command") or "").strip()
-                return f"run: <code>{escape_html(shorten_command(command, 110))}</code>"
-            return None
+                if not command:
+                    return False
+                key = self.get_progress_command_key(item)
+                active_commands = progress_state.setdefault("active_commands", {})
+                active_commands[key] = command
+                progress_state["error"] = ""
+                return True
+            return False
 
         if event_type == "item.completed":
             item = payload.get("item") or {}
@@ -2990,25 +3016,29 @@ class CodexTelegramBridge:
             if item_type == "agent_message":
                 text = str(item.get("text") or "").strip()
                 if text:
-                    return f"💬 {escape_html(shorten_text(first_visible_line(text), 140))}"
-                return None
+                    progress_state["note"] = first_visible_line(text)
+                    progress_state["error"] = ""
+                    return True
+                return False
             if item_type == "command_execution":
+                key = self.get_progress_command_key(item)
+                active_commands = progress_state.setdefault("active_commands", {})
+                active_commands.pop(key, None)
                 command = str(item.get("command") or "").strip()
                 exit_code = item.get("exit_code")
                 status = str(item.get("status") or "").strip()
                 if status == "failed" or (isinstance(exit_code, int) and exit_code != 0):
-                    return f"exit {escape_html(str(exit_code))}: <code>{escape_html(shorten_command(command, 90))}</code>"
-                return f"done: <code>{escape_html(shorten_command(command, 90))}</code>"
-            return None
+                    progress_state["error"] = (
+                        f"command failed ({exit_code}): {shorten_command(command, 100)}"
+                    )
+                return True
+            return False
 
         if event_type == "turn.completed":
-            usage = payload.get("usage") or {}
-            output_tokens = usage.get("output_tokens")
-            if output_tokens is not None:
-                return f"turn completed: <code>{escape_html(str(output_tokens))}</code> output tokens"
-            return "turn completed"
+            progress_state.setdefault("active_commands", {}).clear()
+            return True
 
-        return None
+        return False
 
     def _typing_heartbeat(self, chat_id: str, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
@@ -3169,15 +3199,11 @@ class CodexTelegramBridge:
         schedule = str(job.get("schedule") or "")
         progress_message_id = None
         try:
+            initial_progress_state = self.create_progress_state(chat_id, None)
+            initial_progress_state["note"] = f"cron: {str(job.get('name') or job_id or 'cron')}"
             progress_message_id = self.send_panel(
                 chat_id,
-                self.build_progress_text(
-                    [
-                        f"cron: <code>{escape_html(str(job.get('name') or job_id or 'cron'))}</code>",
-                        f"schedule: <code>{escape_html(schedule)}</code>",
-                    ],
-                    "Running cron",
-                ),
+                self.build_progress_text(initial_progress_state, "Running cron"),
             )
             with self.state_lock:
                 if self.active_job is not None:
@@ -3197,13 +3223,12 @@ class CodexTelegramBridge:
                 already_formatted=True,
             )
             if progress_message_id:
+                failed_progress_state = self.create_progress_state(chat_id, progress_message_id)
+                failed_progress_state["error"] = str(exc)
                 self.edit_message(
                     chat_id,
                     progress_message_id,
-                    self.build_progress_text(
-                        [f"cron: <code>{escape_html(str(job.get('name') or job_id or 'cron'))}</code>"],
-                        "Cron failed",
-                    ),
+                    self.build_progress_text(failed_progress_state, "Cron failed"),
                 )
         finally:
             with self.state_lock:
