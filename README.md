@@ -131,6 +131,10 @@ Use this only for a private single-operator setup.
 | `CODEX_CHANNEL` | npm channel or exact version |
 | `CODEX_MODEL` | Optional model override |
 | `CODEX_EXTRA_ARGS` | Extra flags passed to `codex exec` |
+| `PROGRESS_DISPLAY_MODE` | `current` for live state or `log` for stacked event history |
+| `PROGRESS_IDLE_TEXT` | Text shown when Codex is thinking and no command is running |
+| `PROGRESS_INCLUDE_AGENT_NOTES` | Whether to show short agent notes in the progress panel |
+| `PROGRESS_MAX_ACTIVE_COMMANDS` | Maximum concurrent commands shown in `current` mode |
 | `VOICE_LOCALE` | Default locale for voice input/output, for example `en_US`, `es_ES`, `fr_FR` |
 | `STT_MODEL` | Faster-Whisper model name for audio transcription |
 | `STT_LANGUAGE` | Optional transcription language hint. Leave it empty to derive it from `VOICE_LOCALE` |
@@ -172,6 +176,20 @@ VOICE_LOCALE=fr_FR
 ```
 
 If you want a specific Piper voice instead of the preset, set `TTS_PIPER_VOICE` directly.
+
+## Progress panel
+
+The Telegram progress panel is configurable from `.env`.
+
+```env
+PROGRESS_DISPLAY_MODE=current
+PROGRESS_IDLE_TEXT=thinking...
+PROGRESS_INCLUDE_AGENT_NOTES=true
+PROGRESS_MAX_ACTIVE_COMMANDS=6
+```
+
+- `current`: shows only what Codex is doing right now
+- `log`: keeps the short stacked event history
 
 ## Sessions
 

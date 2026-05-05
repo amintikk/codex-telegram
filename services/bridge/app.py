@@ -135,6 +135,17 @@ TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "5000").strip() or "5000")
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "piper").strip().lower() or "piper"
 TTS_PIPER_VOICE = os.environ.get("TTS_PIPER_VOICE", "").strip()
 TTS_PIPER_DIR = Path(os.environ.get("TTS_PIPER_DIR", "/data/piper-voices"))
+PROGRESS_DISPLAY_MODE = os.environ.get("PROGRESS_DISPLAY_MODE", "current").strip().lower() or "current"
+PROGRESS_IDLE_TEXT = os.environ.get("PROGRESS_IDLE_TEXT", "thinking...").strip() or "thinking..."
+PROGRESS_INCLUDE_AGENT_NOTES = os.environ.get("PROGRESS_INCLUDE_AGENT_NOTES", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+PROGRESS_MAX_ACTIVE_COMMANDS = int(
+    os.environ.get("PROGRESS_MAX_ACTIVE_COMMANDS", "6").strip() or "6"
+)
 PHOTO_OUTPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 OUTPUT_FILE_LINE_RE = re.compile(r"^\s*OUTPUT_FILE:\s*(?P<path>.+?)\s*$", re.MULTILINE)
 AUDIO_INPUT_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".oga", ".opus", ".aac", ".flac", ".mp4", ".mpeg"}
@@ -2900,10 +2911,24 @@ class CodexTelegramBridge:
             "active_commands": {},
             "note": "",
             "error": "",
+            "lines": [],
             "last_render_at": 0.0,
         }
 
+    def append_progress_line(self, progress_state: dict[str, Any], line: str) -> None:
+        clean = str(line or "").strip()
+        if not clean:
+            return
+        progress_state["lines"].append(clean)
+        progress_state["lines"] = progress_state["lines"][-20:]
+
     def build_progress_text(self, progress_state: dict[str, Any], status: str) -> str:
+        if PROGRESS_DISPLAY_MODE == "log":
+            rendered_lines = list(progress_state.get("lines") or [])
+            if not rendered_lines:
+                rendered_lines = [escape_html(PROGRESS_IDLE_TEXT)]
+            return "\n".join([f"<b>{escape_html(status)}</b>", "", *rendered_lines[-12:]])
+
         lines: list[str] = []
         error_text = str(progress_state.get("error") or "").strip()
         note_text = str(progress_state.get("note") or "").strip()
@@ -2912,14 +2937,14 @@ class CodexTelegramBridge:
         if error_text:
             lines.append(f"error: {escape_html(shorten_text(error_text, 180))}")
         elif active_commands:
-            for command in active_commands[:6]:
+            for command in active_commands[: max(1, PROGRESS_MAX_ACTIVE_COMMANDS)]:
                 lines.append(f"run: <code>{escape_html(shorten_command(command, 110))}</code>")
-        elif note_text:
+        elif note_text and PROGRESS_INCLUDE_AGENT_NOTES:
             lines.append(escape_html(shorten_text(note_text, 180)))
         else:
-            lines.append("thinking...")
+            lines.append(escape_html(PROGRESS_IDLE_TEXT))
 
-        if note_text and active_commands:
+        if note_text and active_commands and PROGRESS_INCLUDE_AGENT_NOTES:
             lines.append("")
             lines.append(escape_html(shorten_text(note_text, 180)))
 
@@ -2982,7 +3007,9 @@ class CodexTelegramBridge:
         if event_type == "turn.started":
             progress_state["error"] = ""
             if not progress_state.get("note"):
-                progress_state["note"] = "thinking..."
+                progress_state["note"] = PROGRESS_IDLE_TEXT
+            if PROGRESS_DISPLAY_MODE == "log":
+                self.append_progress_line(progress_state, "turn started")
             return True
 
         if event_type in {"error", "turn.failed"}:
@@ -2994,6 +3021,11 @@ class CodexTelegramBridge:
                 if isinstance(error_payload, dict):
                     message = str(error_payload.get("message") or "").strip()
             progress_state["error"] = message or "task failed"
+            if PROGRESS_DISPLAY_MODE == "log":
+                self.append_progress_line(
+                    progress_state,
+                    f"error: {shorten_text(progress_state['error'], 140)}",
+                )
             return True
 
         if event_type == "item.started":
@@ -3007,6 +3039,11 @@ class CodexTelegramBridge:
                 active_commands = progress_state.setdefault("active_commands", {})
                 active_commands[key] = command
                 progress_state["error"] = ""
+                if PROGRESS_DISPLAY_MODE == "log":
+                    self.append_progress_line(
+                        progress_state,
+                        f"run: <code>{escape_html(shorten_command(command, 110))}</code>",
+                    )
                 return True
             return False
 
@@ -3018,6 +3055,11 @@ class CodexTelegramBridge:
                 if text:
                     progress_state["note"] = first_visible_line(text)
                     progress_state["error"] = ""
+                    if PROGRESS_DISPLAY_MODE == "log" and PROGRESS_INCLUDE_AGENT_NOTES:
+                        self.append_progress_line(
+                            progress_state,
+                            escape_html(shorten_text(progress_state["note"], 140)),
+                        )
                     return True
                 return False
             if item_type == "command_execution":
@@ -3031,11 +3073,23 @@ class CodexTelegramBridge:
                     progress_state["error"] = (
                         f"command failed ({exit_code}): {shorten_command(command, 100)}"
                     )
+                    if PROGRESS_DISPLAY_MODE == "log":
+                        self.append_progress_line(
+                            progress_state,
+                            f"exit {escape_html(str(exit_code))}: <code>{escape_html(shorten_command(command, 90))}</code>",
+                        )
+                elif PROGRESS_DISPLAY_MODE == "log":
+                    self.append_progress_line(
+                        progress_state,
+                        f"done: <code>{escape_html(shorten_command(command, 90))}</code>",
+                    )
                 return True
             return False
 
         if event_type == "turn.completed":
             progress_state.setdefault("active_commands", {}).clear()
+            if PROGRESS_DISPLAY_MODE == "log":
+                self.append_progress_line(progress_state, "turn completed")
             return True
 
         return False
