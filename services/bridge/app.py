@@ -1382,6 +1382,9 @@ class CodexTelegramBridge:
             self.set_chat_success_state(chat_id)
 
         if stopped:
+            progress_state.setdefault("active_commands", {}).clear()
+            progress_state["note"] = "cancelled."
+            progress_state["error"] = ""
             self.finish_progress_state(progress_state, "Stopped")
             return "<b>Stopped</b>\nThe running Codex task was cancelled.", True, []
 
@@ -1408,6 +1411,9 @@ class CodexTelegramBridge:
             self.finish_progress_state(progress_state, "Failed")
             return body, False, output_files
 
+        progress_state.setdefault("active_commands", {}).clear()
+        progress_state["note"] = "done."
+        progress_state["error"] = ""
         self.finish_progress_state(progress_state, "Completed")
         return body, False, output_files
 
